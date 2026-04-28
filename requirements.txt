@@ -1,0 +1,8 @@
+streamlit
+streamlit-autorefresh
+numpy
+pandas
+requests
+folium
+matplotlib
+geopy
