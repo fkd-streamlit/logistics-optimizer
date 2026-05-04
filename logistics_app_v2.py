@@ -1,29 +1,39 @@
 """
-logistics_app_v6.py
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-■ 左パネル：複数トラック動的迂回シミュレーション
-  - 3台のトラックが同時走行
-  - 走行中にランダムで通行止め（2点）が発生
-  - 各トラックが SA で個別に迂回ルートを再計算
-  - folium アニメーション（AntPath）で可視化
+logistics_app_v2.py
+グローバル物流ルート + 工場内AGVシミュレーション
+── SA（焼きなまし法）による迂回ルート最適化 ──
 
-■ 右パネル：工場内 AGV ビジュアルシミュレーション
-  - HTML Canvas による工場フロア等角投影図
-  - 搬送路レーン・棚・機械を描画
-  - AGV 5台が滑らかに走行・衝突回避
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+主な改善点：
+  1. ORS avoid_polygons に依存しない「純粋SA選択」方式
+     - avoid_polygons を使うと日本の細道で経路なしが頻発するため廃止
+     - waypoint候補のルートを全件ORS取得し，violates()でブロック通過チェック
+  2. ブロック配置の堅牢化
+     - ルート点数が少なくてもフォールバック配置
+     - min_sep_km 未満なら間隔を緩めて再試行
+  3. Waypoint候補の多様化
+     - ブロックを「外側へ迂回」する方向だけでなく
+       出発地・目的地の中間帯にも候補を追加
+  4. SA の設計改善
+     - コスト = 距離コスト + 遅延ペナルティ（距離が等しければ時間短いほど良い）
+     - feasible==0 のとき，violates チェックを緩めた最良候補を代替採用
+  5. ロバスト性
+     - ORS 呼び出し失敗を個別 try/except でスキップ
+     - 全候補失敗時は「ルートなし」警告のみ（例外で落ちない）
+  6. AGV 衝突回避の追加
+     - 同一セルに複数台が入ろうとした場合，後着をその場で待機
 """
 
-import math, random, warnings, json
+import math
+import random
+import warnings
 from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
 import requests
 import folium
-from folium.plugins import AntPath
+import matplotlib.pyplot as plt
 import streamlit as st
-import streamlit.components.v1 as components
 
 from geopy.geocoders import Nominatim
 from geopy.distance import geodesic, distance as geo_distance
@@ -32,792 +42,711 @@ from streamlit_autorefresh import st_autorefresh
 
 warnings.simplefilter("ignore", InsecureRequestWarning)
 
-# ═══════════════════════════════════════════
-# ページ設定 & CSS
-# ═══════════════════════════════════════════
-st.set_page_config(page_title="物流×AGV最適化 v3", layout="wide")
+# =========================================================
+# UI skin
+# =========================================================
+st.set_page_config(page_title="生産ラインシミュレーションアプリ v2", layout="wide")
+
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700;900&display=swap');
-* { font-family:'Noto Sans JP',sans-serif; box-sizing:border-box; }
-.stApp { background:#0b0f1a; }
-.block-container { padding-top:1rem; padding-bottom:2rem; max-width:1600px; }
-
-/* ヒーロー */
-.hero { text-align:center; padding:16px 0 12px; }
-.hero h1 {
-  font-size:36px; font-weight:900; margin:0; letter-spacing:.5px;
-  background:linear-gradient(90deg,#ff6b6b,#ffd93d,#6bcb77,#4d96ff);
-  -webkit-background-clip:text; -webkit-text-fill-color:transparent;
-}
-.hero p { color:#8899bb; font-size:14px; margin:6px 0 0; }
-
-/* カード */
+* { font-family: 'Noto Sans JP', sans-serif; }
+.stApp { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%); }
+.block-container { padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1500px; }
+.hero { text-align:center; color:#fff; padding: 18px 0 10px 0; margin-bottom: 18px; }
+.hero h1 { font-size:40px; font-weight:900; margin:0; letter-spacing:1px;
+            background: linear-gradient(90deg,#e94560,#0f3460,#53d8fb);
+            -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+.hero p { font-size:16px; color:#aac4ff; margin:8px 0 0 0; }
 .card {
-  background:rgba(255,255,255,0.03);
-  border:1px solid rgba(255,255,255,0.08);
-  border-radius:14px;
-  padding:16px;
-  box-shadow:0 8px 32px rgba(0,0,0,0.5);
-  color:#dde;
+  background: rgba(255,255,255,0.04);
+  border-radius: 16px;
+  padding: 18px 18px 16px 18px;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.45);
+  border: 1px solid rgba(255,255,255,0.10);
+  color: #e0e0e0;
 }
 .card-title {
-  font-size:17px; font-weight:900; color:#4d96ff;
-  margin:0 0 8px; display:flex; align-items:center; gap:8px;
+  display:flex; align-items:center; gap:10px;
+  font-size:20px; font-weight:900; color:#53d8fb;
+  margin:0 0 10px 0;
 }
-.hrline {
-  height:2px; border-radius:2px; margin:0 0 12px;
-  background:linear-gradient(90deg,#ff6b6b,#4d96ff);
-}
-
-/* ボタン */
+.hrline { height:2px; background:linear-gradient(90deg,#e94560,#53d8fb);
+          opacity:0.7; border-radius:2px; margin:8px 0 14px 0; }
 .stButton>button {
-  border-radius:8px; padding:.6rem .8rem; font-weight:900;
-  border:none; width:100%;
-  background:linear-gradient(90deg,#ff6b6b,#4d96ff);
-  color:#fff; box-shadow:0 4px 14px rgba(0,0,0,0.4);
+  width:100%;
+  border-radius: 10px;
+  padding: 0.75rem 1rem;
+  font-weight: 900;
+  border: none;
+  background: linear-gradient(90deg, #e94560, #0f3460);
+  color: white;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.4);
+  transition: opacity .2s;
 }
 .stButton>button:hover { opacity:.85; }
-
-/* サイドバー */
-section[data-testid="stSidebar"]>div {
-  background:rgba(10,14,28,0.97);
-  border-right:1px solid rgba(255,255,255,0.06);
+section[data-testid="stSidebar"] > div {
+  background: rgba(15,20,40,0.95);
+  border-right: 1px solid rgba(255,255,255,0.08);
+  color: #ccc;
 }
-label,.stCheckbox label,.stSlider label { color:#8899bb !important; }
-
-/* ステータスバッジ */
-.badge {
-  display:inline-block; border-radius:6px; padding:2px 8px;
-  font-size:12px; font-weight:700; margin:2px;
-}
-.badge-run  { background:#1a3a1a; color:#6bcb77; border:1px solid #6bcb77; }
-.badge-reroute { background:#3a2a00; color:#ffd93d; border:1px solid #ffd93d; }
-.badge-block { background:#3a0a0a; color:#ff6b6b; border:1px solid #ff6b6b; }
-.badge-done { background:#0a1a3a; color:#4d96ff; border:1px solid #4d96ff; }
+label, .stSelectbox label, .stSlider label, .stCheckbox label { color:#aac4ff !important; }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown("""
 <div class="hero">
-  <h1>🚛 物流×AGV 量子インスパイア最適化 v3</h1>
-  <p>複数トラック動的迂回（SA） ＋ 工場内AGV5台 リアルタイムシミュレーション</p>
+  <h1>🏭 生産ラインシミュレーションアプリ v2</h1>
+  <p>グローバル物流（通行止め＋SA最適化） ＋ 工場内 AGV 5台衝突回避シミュレーション</p>
 </div>
 """, unsafe_allow_html=True)
 
-# ═══════════════════════════════════════════
-# Session State
-# ═══════════════════════════════════════════
-_DEF = {
-    # 物流
-    "map_html": None, "route_df": None, "best_route": None,
-    "trucks": None,          # [{id, route, color, status, dist, time}]
-    "blocks": None,          # [(lat,lon), ...]
-    "sim_tick": 0,
-    "sim_running": False,
-    "sim_done": False,
-    "base_route": None,
-    "o_latlon": None, "d_latlon": None,
-    "o_addr": "", "d_addr": "",
-    "api_key_cache": "",
-    "radius_km_cache": 5,
-    # AGV
+# =========================================================
+# session_state 初期化
+# =========================================================
+_defaults = {
+    "map_html": None,
+    "route_df": None,
+    "best_route": None,
+    "geo_info": None,
+    "blocks": None,
     "agv_running": False,
     "agv_tick": 0,
     "agv_state": None,
 }
-for k, v in _DEF.items():
+for k, v in _defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ═══════════════════════════════════════════
-# ── ルーティングユーティリティ ──
-# ═══════════════════════════════════════════
-def geocode(addr, jp_only=True):
-    geo = Nominatim(user_agent="logistics-v3")
+# =========================================================
+# ユーティリティ
+# =========================================================
+def geocode(addr: str, jp_only: bool = True):
+    geo = Nominatim(user_agent="logistics-agv-demo-v2")
     loc = geo.geocode(addr, country_codes="jp" if jp_only else None, exactly_one=True)
     if loc is None:
         raise ValueError(f"住所が見つかりません: {addr}")
     return loc.latitude, loc.longitude, loc.address
 
-def ors_route(api_key, coords_lonlat, timeout=18):
-    if not api_key:
-        return {}
+
+def ors_geojson(api_key: str, coords_lonlat, timeout=20):
+    """
+    avoid_polygons を一切使わず素のルートを取得。
+    呼び出し側でviolates()によりブロック通過チェックを行う。
+    """
+    url = "https://api.openrouteservice.org/v2/directions/driving-car/geojson"
+    headers = {"Authorization": api_key, "Content-Type": "application/json"}
+    body = {"coordinates": coords_lonlat}
     try:
-        url = "https://api.openrouteservice.org/v2/directions/driving-car/geojson"
-        r = requests.post(url,
-            json={"coordinates": coords_lonlat},
-            headers={"Authorization": api_key, "Content-Type": "application/json"},
-            verify=False, timeout=timeout)
+        r = requests.post(url, json=body, headers=headers,
+                          verify=False, timeout=timeout)
         return r.json()
     except Exception:
         return {}
 
-def osrm_route(coords_lonlat, timeout=18):
+def osrm_geojson(coords_lonlat, timeout=20):
+    """
+    ORS失敗時のフォールバック用（APIキー不要）。
+    """
     try:
-        s = ";".join(f"{lon},{lat}" for lon, lat in coords_lonlat)
-        r = requests.get(
-            f"https://router.project-osrm.org/route/v1/driving/{s}",
-            params={"overview":"full","geometries":"geojson"}, timeout=timeout)
+        coord_str = ";".join([f"{lon},{lat}" for lon, lat in coords_lonlat])
+        url = f"https://router.project-osrm.org/route/v1/driving/{coord_str}"
+        params = {"overview": "full", "geometries": "geojson"}
+        r = requests.get(url, params=params, timeout=timeout)
         return r.json()
     except Exception:
         return {}
 
-def extract_route(gj):
-    # ORS
-    feats = gj.get("features")
-    if isinstance(feats, list) and feats:
-        f0 = feats[0]
-        coords = f0.get("geometry", {}).get("coordinates", [])
-        summ   = f0.get("properties", {}).get("summary", {})
-        if isinstance(coords, list) and len(coords) >= 2:
-            route = [[p[1], p[0]] for p in coords if len(p) >= 2]
-            return route, summ.get("distance",0)/1000, summ.get("duration",0)/3600
-    # OSRM
-    routes = gj.get("routes")
-    if isinstance(routes, list) and routes:
-        r0 = routes[0]
-        coords = r0.get("geometry", {}).get("coordinates", [])
-        if isinstance(coords, list) and len(coords) >= 2:
-            route = [[p[1], p[0]] for p in coords if len(p) >= 2]
-            return route, r0.get("distance",0)/1000, r0.get("duration",0)/3600
-    return None, None, None
+def get_route_with_fallback(api_key: str, coords_lonlat, timeout=20):
+    """
+    ORSを優先し、失敗時はOSRMにフォールバックして route を返す。
+    return: route, dist_km, time_hr, source("ORS"/"OSRM"/None)
+    """
+    if api_key:
+        gj = ors_geojson(api_key, coords_lonlat, timeout=timeout)
+        route, dist_km, time_hr = extract_route(gj)
+        if route is not None:
+            return route, dist_km, time_hr, "ORS"
 
-def get_route(api_key, coords_lonlat):
-    """ORS優先 → OSRM フォールバック"""
-    gj = ors_route(api_key, coords_lonlat)
-    route, d, t = extract_route(gj)
-    if route:
-        return route, d, t, "ORS"
-    gj = osrm_route(coords_lonlat)
-    route, d, t = extract_route(gj)
-    if route:
-        return route, d, t, "OSRM"
+    gj = osrm_geojson(coords_lonlat, timeout=timeout)
+    route, dist_km, time_hr = extract_route(gj)
+    if route is not None:
+        return route, dist_km, time_hr, "OSRM"
     return None, None, None, None
 
-def violates(route, centers, radius_km, margin=0.3):
-    thr = radius_km + margin
-    for lat, lon in route:
-        for c in centers:
-            if geodesic((lat, lon), c).km <= thr:
+
+def extract_route(geojson):
+    # ORS
+    feats = geojson.get("features")
+    if isinstance(feats, list) and len(feats) > 0:
+        f0 = feats[0]
+        coords = f0.get("geometry", {}).get("coordinates")
+        summ   = f0.get("properties", {}).get("summary")
+        if isinstance(coords, list) and isinstance(summ, dict):
+            route = [[pt[1], pt[0]] for pt in coords
+                     if isinstance(pt, list) and len(pt) >= 2]
+            if len(route) >= 2:
+                return route, summ.get("distance", 0) / 1000, summ.get("duration", 0) / 3600
+
+    # OSRM
+    routes = geojson.get("routes")
+    if isinstance(routes, list) and len(routes) > 0:
+        r0 = routes[0]
+        coords = r0.get("geometry", {}).get("coordinates")
+        if isinstance(coords, list):
+            route = [[pt[1], pt[0]] for pt in coords
+                     if isinstance(pt, list) and len(pt) >= 2]
+            if len(route) >= 2:
+                return route, r0.get("distance", 0) / 1000, r0.get("duration", 0) / 3600
+
+    return None, None, None
+
+
+# =========================================================
+# ブロック配置
+# =========================================================
+def pick_blocks_on_route(base_route: list, n_blocks: int = 2, min_sep_km: float = 20):
+    """
+    ルート上にランダムに n_blocks 点を配置。
+    ルート点数が少ない・min_sep_km を満たせない場合はフォールバック。
+    """
+    if base_route is None:
+        return None
+
+    n = len(base_route)
+    margin = max(5, n // 10)          # 端から除外するインデックス数
+
+    # ルートが短すぎる場合でも動くように端マージンを動的に縮める
+    if n < n_blocks * 2 + 4:
+        margin = 1
+
+    inner = list(range(margin, max(n - margin, margin + n_blocks)))
+    if len(inner) < n_blocks:
+        inner = list(range(n))
+
+    # min_sep_km を満たすまで最大60回試行。失敗したら間隔を半分に緩める
+    cur_sep = min_sep_km
+    while cur_sep >= 1:
+        for _ in range(60):
+            if len(inner) < n_blocks:
+                break
+            idxs = sorted(random.sample(inner, k=n_blocks))
+            pts = [tuple(base_route[i]) for i in idxs]
+            if all(
+                geodesic(pts[i], pts[j]).km >= cur_sep
+                for i in range(len(pts))
+                for j in range(i + 1, len(pts))
+            ):
+                return pts
+        cur_sep /= 2   # 条件を緩める
+
+    # 最終フォールバック：等分割配置
+    step = max(1, n // (n_blocks + 1))
+    return [tuple(base_route[min(step * (i + 1), n - 1)]) for i in range(n_blocks)]
+
+
+# =========================================================
+# 経路がブロックに入っているか判定
+# =========================================================
+def violates(route_latlon, centers_latlon, radius_km, margin_km=0.3):
+    thr = radius_km + margin_km
+    for lat, lon in route_latlon:
+        for c_lat, c_lon in centers_latlon:
+            if geodesic((lat, lon), (c_lat, c_lon)).km <= thr:
                 return True
     return False
 
-def pick_blocks(base_route, n=2, min_sep=20):
-    if not base_route or len(base_route) < 6:
-        return None
-    N = len(base_route)
-    m = max(3, N // 8)
-    inner = list(range(m, N - m))
-    sep = min_sep
-    while sep >= 1:
-        for _ in range(80):
-            if len(inner) < n:
-                break
-            idxs = sorted(random.sample(inner, n))
-            pts = [tuple(base_route[i]) for i in idxs]
-            if all(geodesic(pts[i], pts[j]).km >= sep
-                   for i in range(n) for j in range(i+1, n)):
-                return pts
-        sep /= 2
-    step = max(1, N // (n+1))
-    return [tuple(base_route[min(step*(i+1), N-1)]) for i in range(n)]
 
-def gen_waypoints(blocks, radius_km, o_ll, d_ll, n_angles=10, n_candidates=40):
-    muls = [2, 3.5, 6, 10, 16]
+# =========================================================
+# Waypoint候補生成（改善版）
+# =========================================================
+def gen_waypoints(
+    centers_latlon, base_radius_km, n_angles=12,
+    o_latlon=None, d_latlon=None
+):
+    """
+    ブロック周辺の外側候補 ＋ 出発地と目的地の中間帯候補 を混合。
+    """
+    multipliers = [2.0, 3.0, 5.0, 8.0, 12.0, 20.0]
     wps = []
-    for c_lat, c_lon in blocks:
-        for mul in muls:
-            for ang in np.linspace(0, 360, n_angles, endpoint=False):
-                dest = geo_distance(kilometers=radius_km*mul).destination((c_lat,c_lon), ang)
-                wps.append((dest.latitude, dest.longitude))
-    o_lat, o_lon = o_ll; d_lat, d_lon = d_ll
-    for t in np.linspace(0.2, 0.8, 6):
-        mlat = o_lat + t*(d_lat-o_lat); mlon = o_lon + t*(d_lon-o_lon)
-        for ang in np.linspace(0, 360, 8, endpoint=False):
-            dest = geo_distance(kilometers=radius_km*5).destination((mlat, mlon), ang)
-            wps.append((dest.latitude, dest.longitude))
-    seen, uniq = set(), []
-    for lat, lon in wps:
-        k = (round(lat,3), round(lon,3))
-        if k not in seen:
-            seen.add(k); uniq.append((lat, lon))
-    random.shuffle(uniq)
-    return uniq[:n_candidates]
 
-def sa_select(costs, n_iter=1500, seed=None):
+    # ① ブロック外周の候補
+    for c_lat, c_lon in centers_latlon:
+        for mul in multipliers:
+            for ang in np.linspace(0, 360, n_angles, endpoint=False):
+                dest = geo_distance(
+                    kilometers=base_radius_km * mul
+                ).destination((c_lat, c_lon), ang)
+                wps.append((dest.latitude, dest.longitude))
+
+    # ② 出発地～目的地の中間帯（端に偏らないよう t=0.3〜0.7）
+    if o_latlon and d_latlon:
+        o_lat, o_lon = o_latlon
+        d_lat, d_lon = d_latlon
+        for t in np.linspace(0.2, 0.8, 7):
+            mid_lat = o_lat + t * (d_lat - o_lat)
+            mid_lon = o_lon + t * (d_lon - o_lon)
+            # 中間点の少しずれた位置を候補に
+            for ang in np.linspace(0, 360, 8, endpoint=False):
+                dest = geo_distance(
+                    kilometers=base_radius_km * 4
+                ).destination((mid_lat, mid_lon), ang)
+                wps.append((dest.latitude, dest.longitude))
+
+    # 重複除去
+    uniq, seen = [], set()
+    for lat, lon in wps:
+        key = (round(lat, 3), round(lon, 3))
+        if key not in seen:
+            seen.add(key)
+            uniq.append((lat, lon))
+    return uniq
+
+
+# =========================================================
+# SA（焼きなまし法）：feasible リストからインデックスを選択
+# =========================================================
+def simulated_annealing(costs, n_iter=2000, T0=1.0, alpha=0.993, seed=42):
     rnd = random.Random(seed)
     n = len(costs)
-    if n == 0: return None
-    if n == 1: return 0
-    cur = best = rnd.randrange(n)
-    T = 1.0
+    if n == 0:
+        return None
+    if n == 1:
+        return 0
+    cur  = rnd.randrange(n)
+    best = cur
+    T    = T0
     for _ in range(n_iter):
         nxt = rnd.randrange(n)
-        d = costs[nxt] - costs[cur]
-        if d < 0 or rnd.random() < math.exp(-d / max(T, 1e-9)):
+        if nxt == cur:
+            continue
+        delta = costs[nxt] - costs[cur]
+        if delta < 0 or rnd.random() < math.exp(-delta / max(T, 1e-9)):
             cur = nxt
         if costs[cur] < costs[best]:
             best = cur
-        T *= 0.993
+        T *= alpha
     return best
 
-TRUCK_COLORS = ["#ff6b6b", "#ffd93d", "#6bcb77"]
 
-# ═══════════════════════════════════════════
-# ── SA 迂回ルート探索（1台分）──
-# ═══════════════════════════════════════════
-def find_detour(api_key, o_ll, d_ll, blocks, radius_km, due_time, max_try=8):
-    o_lat, o_lon = o_ll; d_lat, d_lon = d_ll
-    coords_od = [[o_lon, o_lat], [d_lon, d_lat]]
+# =========================================================
+# folium HTML → data URL
+# =========================================================
+def folium_to_data_url(html: str) -> str:
+    return "data:text/html;charset=utf-8," + quote(html)
 
-    wps = gen_waypoints(blocks, radius_km, o_ll, d_ll, n_candidates=30)
 
-    feasible = []; loose = []
-    for tag, coords in [("BASE", coords_od)] + [(f"WP{i+1}", [[o_lon,o_lat],[lon,lat],[d_lon,d_lat]])
-                                                 for i,(lat,lon) in enumerate(wps)]:
-        route, dist, time_, _ = get_route(api_key, coords)
-        if not route: continue
-        cost = dist*120 + max(0, time_-due_time)*5000
-        entry = {"tag": tag, "route": route, "dist": dist, "time": time_, "cost": cost}
-        (feasible if not violates(route, blocks, radius_km) else loose).append(entry)
-
-    pool = feasible if feasible else loose
-    if not pool: return None
-    idx = sa_select([e["cost"] for e in pool], seed=random.randint(0, 9999))
-    return pool[idx]
-
-# ═══════════════════════════════════════════
-# ── folium 地図生成 ──
-# ═══════════════════════════════════════════
-def build_map(o_ll, d_ll, trucks, blocks, radius_km, base_route):
-    o_lat, o_lon = o_ll; d_lat, d_lon = d_ll
-    m = folium.Map(location=[(o_lat+d_lat)/2, (o_lon+d_lon)/2],
-                   zoom_start=6, tiles="CartoDB DarkMatter")
-
-    # ベースルート（グレー破線）
-    if base_route:
-        folium.PolyLine(base_route, color="#555", weight=3,
-                        dash_array="6,6", tooltip="通常ルート").add_to(m)
-
-    # トラックルート
-    for tk in (trucks or []):
-        if tk.get("route"):
-            if tk["status"] in ("reroute", "done"):
-                AntPath(tk["route"], color=tk["color"],
-                        weight=5, delay=800, tooltip=f"🚛 トラック{tk['id']} 迂回中").add_to(m)
-            else:
-                folium.PolyLine(tk["route"], color=tk["color"],
-                                weight=5, opacity=0.8,
-                                tooltip=f"🚛 トラック{tk['id']}").add_to(m)
-
-            # トラック現在位置（進捗で補間）
-            prog = min(tk.get("progress", 0), len(tk["route"])-1)
-            pos  = tk["route"][prog]
-            folium.CircleMarker(pos, radius=10,
-                color=tk["color"], fill=True, fill_opacity=1,
-                tooltip=f"🚛 {tk['id']} [{tk['status']}]").add_to(m)
-
-    # 通行止め
-    if blocks:
-        for b_lat, b_lon in blocks:
-            folium.Circle([b_lat,b_lon], radius=radius_km*1000,
-                color="#ff4444", fill=True, fill_opacity=0.25,
-                tooltip="🚧 通行止め").add_to(m)
-            folium.Marker([b_lat,b_lon],
-                icon=folium.Icon(icon="ban", prefix="fa", color="red"),
-                tooltip="🚧 通行止め").add_to(m)
-
-    # 出発・到着
-    folium.Marker([o_lat,o_lon],
-        icon=folium.Icon(icon="play", prefix="fa", color="blue"),
-        tooltip="出発").add_to(m)
-    folium.Marker([d_lat,d_lon],
-        icon=folium.Icon(icon="flag-checkered", prefix="fa", color="darkgreen"),
-        tooltip="到着").add_to(m)
-
-    return m.get_root().render()
-
-# ═══════════════════════════════════════════
-# ── サイドバー ──
-# ═══════════════════════════════════════════
+# =========================================================
+# Sidebar
+# =========================================================
 with st.sidebar:
     st.markdown("## ⚙️ 設定")
     st.markdown("---")
-    api_key   = st.text_input("ORS API Key（任意）", type="password")
-    st.caption("未入力時は OSRM（無料）で陸路を計算します。")
+    api_key   = st.text_input("OpenRouteService API Key（任意）", type="password")
+    st.caption("未入力時は OSRM フォールバックで陸路を計算します。")
     origin    = st.text_input("輸送元（住所）", "大阪府堺市")
     dest_addr = st.text_input("輸送先（住所）", "山口県下関市")
     due_time  = st.slider("納期（時間）", 5, 72, 24)
     jp_only   = st.checkbox("日本国内モード", value=True)
 
-    st.markdown("### 🚧 通行止め設定")
-    radius_km  = st.slider("影響半径 (km)", 1, 20, 5)
-    min_sep_km = st.slider("2点間の最小間隔 (km)", 5, 80, 20)
-    block_tick = st.slider("通行止め発生タイミング（tick）", 3, 20, 8)
+    st.markdown("### 🚧 通行止め（ランダム2点）")
+    enable_blocks = st.checkbox("通行止めを有効化", value=True)
+    radius_km     = st.slider("影響半径 (km)", 1, 20, 5)
+    min_sep_km    = st.slider("通行止め2点の最小間隔 (km)", 5, 100, 20)
+    n_candidates  = st.slider("迂回候補数", 10, 80, 40)
+    sa_iters      = st.slider("SA反復回数", 500, 5000, 2000)
+    max_resample  = st.slider("再抽選最大回数", 3, 30, 10)
 
-    st.markdown("### 🚛 シミュレーション")
-    sim_speed = st.slider("アニメ速度（ms/tick）", 200, 1500, 500)
-    debug     = st.checkbox("デバッグ表示", value=False)
-    st.markdown("---")
+    debug = st.checkbox("デバッグ表示", value=False)
+    run   = st.button("🚀 ルート計算（通行止め＋SA）")
+    if run:
+        st.session_state.agv_running = False
 
-    col1, col2 = st.columns(2)
-    btn_init = col1.button("📍 ルート準備")
-    btn_start= col2.button("▶ シミュ開始")
-    btn_stop = st.button("⏹ 停止 / リセット")
+# =========================================================
+# レイアウト
+# =========================================================
+left, right = st.columns([1.2, 1.2], gap="large")
 
-# ═══════════════════════════════════════════
-# ── ボタン処理 ──
-# ═══════════════════════════════════════════
-if btn_stop:
-    st.session_state.sim_running = False
-    st.session_state.sim_done    = False
-    st.session_state.sim_tick    = 0
-    st.session_state.trucks      = None
-    st.session_state.blocks      = None
-    st.session_state.map_html    = None
-
-if btn_init:
-    with st.spinner("ジオコーディング & ベースルート取得中…"):
-        try:
-            o_lat, o_lon, o_addr = geocode(origin, jp_only=jp_only)
-            d_lat, d_lon, d_addr = geocode(dest_addr, jp_only=jp_only)
-            base_route, bd, bt, src = get_route(api_key, [[o_lon,o_lat],[d_lon,d_lat]])
-            if base_route is None:
-                st.error("ベースルートを取得できませんでした。")
-            else:
-                if src == "OSRM":
-                    st.info("ORS 未使用：OSRM でルートを計算しています。")
-                # 3台のトラックを初期化（同じルートから出発）
-                trucks = []
-                for i, color in enumerate(TRUCK_COLORS):
-                    trucks.append({
-                        "id": i+1, "color": color,
-                        "route": base_route,
-                        "progress": i * max(1, len(base_route)//6),  # スタート位置をずらす
-                        "status": "run",
-                        "dist": bd, "time": bt,
-                    })
-                st.session_state.trucks       = trucks
-                st.session_state.base_route   = base_route
-                st.session_state.o_latlon     = (o_lat, o_lon)
-                st.session_state.d_latlon     = (d_lat, d_lon)
-                st.session_state.o_addr       = o_addr
-                st.session_state.d_addr       = d_addr
-                st.session_state.blocks       = None
-                st.session_state.sim_tick     = 0
-                st.session_state.sim_running  = False
-                st.session_state.sim_done     = False
-                st.session_state.api_key_cache    = api_key
-                st.session_state.radius_km_cache  = radius_km
-                # 初期地図
-                st.session_state.map_html = build_map(
-                    (o_lat,o_lon),(d_lat,d_lon), trucks, None, radius_km, base_route)
-                st.success(f"準備完了 — 出発: {o_addr} → 到着: {d_addr}  ▶ シミュ開始 を押してください")
-        except Exception as e:
-            st.error(f"エラー: {e}")
-
-if btn_start and st.session_state.trucks:
-    st.session_state.sim_running = True
-    st.session_state.sim_done    = False
-
-# ═══════════════════════════════════════════
-# ── シミュレーション tick ──
-# ═══════════════════════════════════════════
-if st.session_state.sim_running and not st.session_state.sim_done:
-    st_autorefresh(interval=sim_speed, key="sim_refresh")
-
-    tick   = st.session_state.sim_tick + 1
-    trucks = st.session_state.trucks
-    blocks = st.session_state.blocks
-    o_ll   = st.session_state.o_latlon
-    d_ll   = st.session_state.d_latlon
-    ak     = st.session_state.api_key_cache
-    rkm    = st.session_state.radius_km_cache
-
-    # 通行止め発生
-    if tick == block_tick and blocks is None and st.session_state.base_route:
-        blocks = pick_blocks(st.session_state.base_route, min_sep=min_sep_km)
-        st.session_state.blocks = blocks
-        # 各トラックをリルート状態に
-        if blocks:
-            for tk in trucks:
-                if tk["status"] == "run":
-                    tk["status"] = "reroute"
-
-    # 各トラックの処理
-    all_done = True
-    for tk in trucks:
-        if tk["status"] == "done":
-            continue
-        all_done = False
-
-        # 迂回ルート計算（reroute 状態で1回だけ）
-        if tk["status"] == "reroute" and blocks:
-            # 現在位置から目的地への迂回ルートを計算
-            prog = min(tk.get("progress", 0), len(tk["route"])-1)
-            cur_pos = tk["route"][prog]  # [lat, lon]
-            cur_ll  = (cur_pos[0], cur_pos[1])
-
-            result = find_detour(ak, cur_ll, d_ll, blocks, rkm, due_time)
-            if result:
-                tk["route"]    = result["route"]
-                tk["dist"]     = result["dist"]
-                tk["time"]     = result["time"]
-                tk["progress"] = 0
-            tk["status"] = "run"
-
-        # 進捗を進める
-        step = max(1, len(tk["route"]) // 40)
-        tk["progress"] = min(tk["progress"] + step, len(tk["route"]) - 1)
-        if tk["progress"] >= len(tk["route"]) - 1:
-            tk["status"] = "done"
-
-    if all_done:
-        st.session_state.sim_done    = True
-        st.session_state.sim_running = False
-
-    st.session_state.trucks   = trucks
-    st.session_state.sim_tick = tick
-
-    # 地図更新
-    if o_ll and d_ll:
-        st.session_state.map_html = build_map(
-            o_ll, d_ll, trucks, blocks, rkm, st.session_state.base_route)
-
-# ═══════════════════════════════════════════
-# ── AGV 工場シミュレーション 定義 ──
-# ═══════════════════════════════════════════
-FACTORY_W, FACTORY_H = 800, 500  # キャンバスサイズ
-
-# 工場レイアウト定義（ピクセル座標）
-FACTORY_STATIONS = {
-    "入荷ゾーン":   (80,  420),
-    "検品台A":      (200, 320),
-    "組立ライン1":  (370, 200),
-    "組立ライン2":  (370, 350),
-    "品質検査":     (540, 260),
-    "出荷ゾーン":   (700, 420),
-    "充電ステーション": (80, 120),
-}
-STATION_LIST = list(FACTORY_STATIONS.values())
-STATION_NAMES = list(FACTORY_STATIONS.keys())
-AGV_COLORS_HEX = ["#ff6b6b", "#ffd93d", "#6bcb77", "#4d96ff", "#bf5af2"]
-
-def init_agvs_factory():
-    agvs = []
-    used = set()
-    charge_pos = FACTORY_STATIONS["充電ステーション"]
-    for i in range(5):
-        # スタートを充電ステーション付近に分散
-        sx = charge_pos[0] + (i - 2) * 30
-        sy = charge_pos[1] + random.randint(-20, 20)
-        sx = max(50, min(FACTORY_W-50, sx))
-        sy = max(50, min(FACTORY_H-50, sy))
-        goal_idx = random.randint(0, len(STATION_LIST)-1)
-        agvs.append({
-            "id": i+1,
-            "x": float(sx), "y": float(sy),
-            "gx": float(STATION_LIST[goal_idx][0]),
-            "gy": float(STATION_LIST[goal_idx][1]),
-            "goal_name": STATION_NAMES[goal_idx],
-            "color": AGV_COLORS_HEX[i],
-            "speed": 3.0 + random.uniform(-0.5, 1.0),
-            "dwell": 0,
-            "wait": 0,
-            "status": "run",  # run / dwell / wait
-        })
-    return agvs
-
-if st.session_state.agv_state is None:
-    st.session_state.agv_state = init_agvs_factory()
-
-def agv_step(agvs):
-    """AGV 1ステップ更新（衝突回避付き）"""
-    # 予定移動先を計算
-    proposals = []
-    for agv in agvs:
-        if agv["dwell"] > 0:
-            agv["dwell"] -= 1
-            if agv["dwell"] == 0:
-                agv["status"] = "run"
-                # 次のゴールを SA 的にランダム選択（距離をコストとして重み付け）
-                dists = [math.hypot(agv["x"]-s[0], agv["y"]-s[1]) for s in STATION_LIST]
-                # SAで選択（近いほどコストが低いが，時々遠くも選ぶ）
-                idx = sa_select(dists, n_iter=100, seed=None)
-                agv["gx"] = float(STATION_LIST[idx][0])
-                agv["gy"] = float(STATION_LIST[idx][1])
-                agv["goal_name"] = STATION_NAMES[idx]
-            proposals.append((agv["x"], agv["y"]))
-            continue
-
-        if agv["wait"] > 0:
-            agv["wait"] -= 1
-            agv["status"] = "wait" if agv["wait"] > 0 else "run"
-            proposals.append((agv["x"], agv["y"]))
-            continue
-
-        dx = agv["gx"] - agv["x"]; dy = agv["gy"] - agv["y"]
-        dist = math.hypot(dx, dy)
-        if dist < agv["speed"] + 1:
-            proposals.append((agv["gx"], agv["gy"]))
-        else:
-            nx = agv["x"] + agv["speed"] * dx / dist
-            ny = agv["y"] + agv["speed"] * dy / dist
-            proposals.append((nx, ny))
-
-    # 衝突チェック
-    claimed = {}
-    for i, agv in enumerate(agvs):
-        px, py = proposals[i]
-        collide = False
-        for j, agv2 in enumerate(agvs):
-            if i == j: continue
-            ex, ey = proposals[j]
-            if math.hypot(px-ex, py-ey) < 28:
-                collide = True; break
-        if collide:
-            agv["wait"] = random.randint(1, 3)
-            agv["status"] = "wait"
-        else:
-            agv["x"] = px; agv["y"] = py
-            # ゴール到達チェック
-            if math.hypot(agv["x"]-agv["gx"], agv["y"]-agv["gy"]) < agv["speed"]+1:
-                agv["x"] = agv["gx"]; agv["y"] = agv["gy"]
-                agv["dwell"] = random.randint(5, 15)
-                agv["status"] = "dwell"
-    return agvs
-
-# ═══════════════════════════════════════════
-# ── メインレイアウト ──
-# ═══════════════════════════════════════════
-left, right = st.columns([1.15, 1.15], gap="large")
-
-# ─────────────────────────────────────────
-# 左：複数トラック シミュレーション
-# ─────────────────────────────────────────
+# =========================================================
+# 左カード：物流ルート最適化
+# =========================================================
 with left:
-    st.markdown('<div class="card"><div class="card-title">🌍 複数トラック動的迂回シミュレーション（SA最適化）</div><div class="hrline"></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="card">'
+        '<div class="card-title">🌍 グローバル物流ルート（通行止め＋SA最適化）</div>'
+        '<div class="hrline"></div>',
+        unsafe_allow_html=True
+    )
 
-    # トラックステータス表示
-    trucks = st.session_state.trucks
-    if trucks:
-        cols = st.columns(3)
-        for i, tk in enumerate(trucks):
-            badge_cls = {"run":"badge-run","reroute":"badge-reroute",
-                         "done":"badge-done"}.get(tk["status"], "badge-block")
-            label = {"run":"🟢 走行中","reroute":"🟡 迂回計算","done":"🔵 到着"}.get(tk["status"],"⚫")
-            cols[i].markdown(
-                f'<div class="badge {badge_cls}">🚛 T{tk["id"]} {label}<br>'
-                f'<small>{tk["dist"]:.0f}km / {tk["time"]:.1f}h</small></div>',
-                unsafe_allow_html=True)
+    if run:
+        try:
+            # ── ジオコーディング ──
+            o_lat, o_lon, o_addr = geocode(origin,    jp_only=jp_only)
+            d_lat, d_lon, d_addr = geocode(dest_addr, jp_only=jp_only)
+            st.write(f"輸送元: {o_addr} ({o_lat:.5f}, {o_lon:.5f})")
+            st.write(f"輸送先: {d_addr} ({d_lat:.5f}, {d_lon:.5f})")
+            st.session_state.geo_info = {
+                "origin": (o_addr, o_lat, o_lon),
+                "dest":   (d_addr, d_lat, d_lon),
+            }
 
-    # 通行止め表示
-    blocks = st.session_state.blocks
-    tick   = st.session_state.sim_tick
-    if blocks:
-        st.markdown(f'<div class="badge badge-block">🚧 tick {block_tick} に通行止め発生！ 各トラックが SA 迂回ルートを計算</div>', unsafe_allow_html=True)
-    elif trucks:
-        remain = max(0, block_tick - tick)
-        st.caption(f"⏱ tick {tick} — あと {remain} tick で通行止め発生予定")
+            coords_od = [[o_lon, o_lat], [d_lon, d_lat]]
 
-    if debug and trucks:
-        st.write(f"tick={tick} | blocks={blocks}")
+            # ── ベースルート（avoid なし）──
+            base_route, base_dist, base_time, base_source = get_route_with_fallback(api_key, coords_od)
+            if base_route is None:
+                raise RuntimeError(
+                    "ベースルートを取得できませんでした。"
+                    "住所・ネットワーク・API Key（任意）を確認してください。"
+                )
+            if base_source == "OSRM":
+                st.info("ℹ️ ORSが利用できなかったため、OSRMで陸路を計算しています。")
 
-    if st.session_state.sim_done:
-        st.success("✅ 全トラック到着！ SA による迂回最適化が完了しました。")
+            # ── 通行止めブロック配置ループ ──
+            best_truck  = None
+            best_blocks = None
+            best_base_route = base_route
+            used_blocks_for_map = None
 
-    # 地図
+            for attempt in range(max_resample):
+
+                blocks = (
+                    pick_blocks_on_route(
+                        base_route, n_blocks=2, min_sep_km=min_sep_km
+                    )
+                    if enable_blocks else None
+                )
+
+                # ── Waypoint候補生成 ──
+                # BASE（直接ルート）は常に候補に含める
+                candidates = [("BASE", coords_od)]
+                if blocks:
+                    wps = gen_waypoints(
+                        blocks, radius_km, n_angles=12,
+                        o_latlon=(o_lat, o_lon),
+                        d_latlon=(d_lat, d_lon),
+                    )
+                    random.shuffle(wps)
+                    wps = wps[:n_candidates]
+                    for i, (w_lat, w_lon) in enumerate(wps):
+                        coords3 = [[o_lon, o_lat], [w_lon, w_lat], [d_lon, d_lat]]
+                        candidates.append((f"WP{i+1}", coords3))
+
+                # ── 各候補をORS取得してviolatesチェック ──
+                feasible        = []   # ブロック回避できた候補
+                feasible_loose  = []   # ブロック通過するが取得できた候補（最終手段）
+
+                for tag, coords in candidates:
+                    route, dist_km, time_hr, source = get_route_with_fallback(api_key, coords)
+                    if route is None:
+                        continue
+                    cost = dist_km * 120 + max(0, time_hr - due_time) * 5000
+                    entry = {
+                        "tag":     tag,
+                        "coords":  coords,
+                        "route":   route,
+                        "dist_km": dist_km,
+                        "time_hr": time_hr,
+                        "cost":    cost,
+                        "source":  source,
+                    }
+                    if blocks and violates(route, blocks, radius_km):
+                        feasible_loose.append(entry)   # 通過するが存在はする
+                    else:
+                        feasible.append(entry)         # 回避成功
+
+                if debug:
+                    st.write(
+                        f"attempt {attempt+1}/{max_resample} | "
+                        f"candidates={len(candidates)} | "
+                        f"feasible(回避)={len(feasible)} | "
+                        f"feasible_loose(通過)={len(feasible_loose)}"
+                    )
+
+                # ── SA で最良候補を選択 ──
+                if len(feasible) > 0:
+                    # 正常系：ブロック回避できた候補から選択
+                    costs = [f["cost"] for f in feasible]
+                    idx   = simulated_annealing(costs, n_iter=sa_iters, seed=42)
+                    best_truck   = feasible[idx]
+                    best_blocks  = blocks
+                    used_blocks_for_map = blocks
+                    if debug:
+                        st.success(f"✅ 回避成功 attempt {attempt+1}")
+                    break
+
+                # feasible == 0 で最終試行なら loose から最良を使う
+                if attempt == max_resample - 1 and len(feasible_loose) > 0:
+                    costs = [f["cost"] for f in feasible_loose]
+                    idx   = simulated_annealing(costs, n_iter=sa_iters, seed=42)
+                    best_truck   = feasible_loose[idx]
+                    best_blocks  = blocks
+                    used_blocks_for_map = blocks
+                    st.warning(
+                        "⚠️ 完全な迂回ルートは見つかりませんでしたが、"
+                        "最も通行止め影響の少ない候補を表示します。"
+                        "影響半径・再抽選回数を増やすと改善することがあります。"
+                    )
+
+            # ── 比較表（トラック / 飛行機 / 船）──
+            gc_km = geodesic((o_lat, o_lon), (d_lat, d_lon)).km
+            rows  = []
+
+            if best_truck is not None:
+                rows.append([
+                    "トラック(SA)",
+                    round(best_truck["dist_km"], 1),
+                    round(best_truck["time_hr"], 1),
+                    int(best_truck["cost"]),
+                ])
+
+            plane_time = gc_km / 800 + 4
+            plane_cost = gc_km * 250 + 30000 + max(0, plane_time - due_time) * 5000
+            rows.append(["飛行機", round(gc_km, 1), round(plane_time, 1), int(plane_cost)])
+
+            ship_dist = gc_km * 1.6
+            ship_time = gc_km / 40
+            ship_cost = ship_dist * 72 + 50000 + max(0, ship_time - due_time) * 5000
+            rows.append(["船", round(ship_dist, 1), round(ship_time, 1), int(ship_cost)])
+
+            df = pd.DataFrame(rows, columns=["手段", "距離(km)", "時間(h)", "コスト(円)"])
+            best_mode = df.loc[df["コスト(円)"].idxmin()]["手段"]
+
+            # ── 地図描画 ──
+            m = folium.Map(
+                location=[(o_lat + d_lat) / 2, (o_lon + d_lon) / 2],
+                zoom_start=6,
+                tiles="CartoDB Positron",
+            )
+            # 通常ルート（グレー破線）
+            folium.PolyLine(
+                best_base_route, color="gray", weight=4, opacity=0.6,
+                dash_array="6,6", tooltip="通常ルート(ORS)"
+            ).add_to(m)
+
+            # SA 最適ルート（青）
+            if best_truck is not None:
+                folium.PolyLine(
+                    best_truck["route"], color="#00cfff", weight=6,
+                    opacity=0.9, tooltip=f"SA最適ルート({best_truck['tag']})"
+                ).add_to(m)
+
+            # 通行止め円（オレンジ）
+            if used_blocks_for_map:
+                for b_lat, b_lon in used_blocks_for_map:
+                    folium.Circle(
+                        [b_lat, b_lon], radius=radius_km * 1000,
+                        color="#ff7700", fill=True, fill_opacity=0.25,
+                        tooltip="🚧 通行止め"
+                    ).add_to(m)
+                    folium.Marker(
+                        [b_lat, b_lon],
+                        icon=folium.Icon(icon="ban", prefix="fa", color="red"),
+                        tooltip="🚧 通行止め"
+                    ).add_to(m)
+
+            # 概念線（飛行機：赤、船：緑）
+            folium.PolyLine(
+                [[o_lat, o_lon], [d_lat, d_lon]],
+                color="red", dash_array="10,10", tooltip="飛行機(概念)"
+            ).add_to(m)
+            tokyo_port = [35.63, 139.77]
+            osaka_port = [34.65, 135.43]
+            folium.PolyLine(
+                [[o_lat, o_lon], tokyo_port, osaka_port, [d_lat, d_lon]],
+                color="green", tooltip="船(概念)"
+            ).add_to(m)
+
+            # マーカー
+            folium.Marker(
+                [o_lat, o_lon],
+                icon=folium.Icon(icon="play", prefix="fa", color="blue"),
+                tooltip=f"出発: {o_addr}"
+            ).add_to(m)
+            folium.Marker(
+                [d_lat, d_lon],
+                icon=folium.Icon(icon="flag", prefix="fa", color="darkred"),
+                tooltip=f"到着: {d_addr}"
+            ).add_to(m)
+
+            # セッション保存
+            st.session_state.map_html  = m.get_root().render()
+            st.session_state.route_df  = df
+            st.session_state.best_route = best_mode
+
+            if best_truck is None:
+                st.warning(
+                    "⚠️ 再抽選上限まで試しましたが、ルート候補が見つかりませんでした。"
+                    "API Key・住所・パラメータを確認してください。"
+                )
+            else:
+                avoid_msg = (
+                    f"✅ SA最適化完了 — ルート: {best_truck['tag']} | "
+                    f"候補{len(feasible)}件から選択 | 推奨手段: {best_mode} | "
+                    f"経路API: {best_truck['source']}"
+                )
+                st.success(avoid_msg)
+
+        except Exception as e:
+            st.error(f"実行エラー: {e}")
+            if debug:
+                import traceback
+                st.code(traceback.format_exc())
+
+    # 結果表示（ページ維持）
     if st.session_state.map_html:
-        components.html(st.session_state.map_html, height=420, scrolling=False)
-    else:
-        st.info("← サイドバーから「📍 ルート準備」→「▶ シミュ開始」を押してください")
+        st.markdown("**📍 ルートマップ**")
+        st.iframe(
+            folium_to_data_url(st.session_state.map_html),
+            height=400, width="stretch"
+        )
+        st.dataframe(st.session_state.route_df, use_container_width=True)
+        st.success(f"🏆 推奨手段：{st.session_state.best_route}")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ─────────────────────────────────────────
-# 右：工場 AGV シミュレーション（HTML Canvas）
-# ─────────────────────────────────────────
+
+# =========================================================
+# 右カード：AGV シミュレーション（衝突回避付き）
+# =========================================================
 with right:
-    st.markdown('<div class="card"><div class="card-title">🏭 工場内 AGV シミュレーション（衝突回避）</div><div class="hrline"></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="card">'
+        '<div class="card-title">🏭 工場内 AGV 移動シミュレーション（衝突回避）</div>'
+        '<div class="hrline"></div>',
+        unsafe_allow_html=True
+    )
 
-    ca, cb, cc = st.columns(3)
-    agv_start = ca.button("▶ AGV 開始")
-    agv_stop  = cb.button("⏹ AGV 停止")
-    agv_reset = cc.button("🔄 AGV リセット")
+    GRID     = 20
+    machines = {"A": (10, 5), "B": (15, 15), "C": (5, 14)}
+    machine_list = list(machines.values())
 
-    if agv_start:  st.session_state.agv_running = True
-    if agv_stop:   st.session_state.agv_running = False
-    if agv_reset:
-        st.session_state.agv_state   = init_agvs_factory()
+    # ── AGV 初期化 ──
+    def init_agvs():
+        used = set(machine_list)
+        agvs = []
+        for i in range(5):
+            while True:
+                p = (random.randint(0, GRID - 1), random.randint(0, GRID - 1))
+                if p not in used:
+                    used.add(p)
+                    break
+            agvs.append({
+                "id":    i + 1,
+                "pos":   p,
+                "goal":  random.choice(machine_list),
+                "dwell": random.randint(2, 5),
+                "wait":  0,   # 衝突回避待機カウンタ
+            })
+        return agvs
+
+    if st.session_state.agv_state is None:
+        st.session_state.agv_state = init_agvs()
+
+    c1, c2, c3 = st.columns(3)
+    if c1.button("▶ AGV 開始"):
+        st.session_state.agv_running = True
+    if c2.button("⏹ AGV 停止"):
+        st.session_state.agv_running = False
+    if c3.button("🔄 リセット"):
+        st.session_state.agv_state   = init_agvs()
         st.session_state.agv_tick    = 0
         st.session_state.agv_running = False
 
+    # ── AGV 1ステップ更新（衝突回避付き）──
     if st.session_state.agv_running:
-        st_autorefresh(interval=120, key="agv_refresh")
-        st.session_state.agv_state = agv_step(st.session_state.agv_state)
+        st_autorefresh(interval=400, key="agv_refresh")
+
+        agvs = st.session_state.agv_state
+        occupied = {agv["pos"] for agv in agvs}   # 現在の占有セル
+
+        new_positions = {}   # agv_id -> 移動先
+        for agv in agvs:
+            if agv["wait"] > 0:
+                agv["wait"] -= 1
+                new_positions[agv["id"]] = agv["pos"]
+                continue
+
+            if agv["pos"] == agv["goal"]:
+                agv["dwell"] -= 1
+                if agv["dwell"] <= 0:
+                    agv["goal"]  = random.choice(machine_list)
+                    agv["dwell"] = random.randint(2, 5)
+                new_positions[agv["id"]] = agv["pos"]
+            else:
+                x, y  = agv["pos"]
+                gx, gy = agv["goal"]
+                # 優先軸を選択
+                if abs(gx - x) >= abs(gy - y):
+                    nx, ny = x + int(np.sign(gx - x)), y
+                else:
+                    nx, ny = x, y + int(np.sign(gy - y))
+                nx = max(0, min(GRID - 1, nx))
+                ny = max(0, min(GRID - 1, ny))
+                candidate = (nx, ny)
+
+                # 衝突回避：移動先が他 AGV に占有されていたら待機
+                already_claimed = list(new_positions.values())
+                if candidate in occupied or candidate in already_claimed:
+                    agv["wait"] = random.randint(1, 2)
+                    new_positions[agv["id"]] = agv["pos"]   # 現在地を維持
+                else:
+                    new_positions[agv["id"]] = candidate
+
+        # 位置を更新
+        for agv in agvs:
+            agv["pos"] = new_positions[agv["id"]]
+
         st.session_state.agv_tick += 1
 
-    # AGV 状態を JSON にシリアライズして HTML キャンバスへ渡す
-    agvs_json   = json.dumps(st.session_state.agv_state)
-    stations_json = json.dumps([
-        {"name": n, "x": float(p[0]), "y": float(p[1])}
-        for n, p in FACTORY_STATIONS.items()
-    ])
-    tick_val = st.session_state.agv_tick
+    # ── 描画 ──
+    fig, ax = plt.subplots(figsize=(7, 5))
+    fig.patch.set_facecolor("#0f1826")
+    ax.set_facecolor("#0f1826")
+    ax.set_xlim(-0.5, GRID - 0.5)
+    ax.set_ylim(-0.5, GRID - 0.5)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.15, color="white")
+    ax.set_title(
+        f"⏱ Time = {st.session_state.agv_tick}",
+        color="white", fontsize=14, fontweight="bold"
+    )
+    ax.tick_params(colors="gray")
 
-    factory_html = f"""
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  body {{ margin:0; background:#0b0f1a; display:flex; flex-direction:column;
-          align-items:center; font-family:'Segoe UI',sans-serif; }}
-  canvas {{ border-radius:10px; box-shadow:0 0 30px rgba(77,150,255,0.3); }}
-  .legend {{ color:#8899bb; font-size:12px; margin:6px 0 0; }}
-</style>
-</head>
-<body>
-<canvas id="c" width="{FACTORY_W}" height="{FACTORY_H}"></canvas>
-<div class="legend">⏱ Time = {tick_val} &nbsp;|&nbsp;
-  🟢走行 &nbsp; 🟡停車中 &nbsp; 🔴衝突回避待機</div>
-<script>
-const W={FACTORY_W}, H={FACTORY_H};
-const agvs  = {agvs_json};
-const stats = {stations_json};
-const c = document.getElementById('c');
-const ctx = c.getContext('2d');
+    # 機械
+    for name, pos in machines.items():
+        ax.scatter(pos[0], pos[1], s=300, c="#53d8fb",
+                   marker="s", zorder=5, edgecolors="white", linewidths=1.5)
+        ax.text(pos[0] + 0.3, pos[1] + 0.3, name,
+                fontsize=13, weight="bold", color="white", zorder=6)
 
-// ── 背景：工場フロア ──
-function drawFactory() {{
-  // 床
-  const floorGrad = ctx.createLinearGradient(0,0,0,H);
-  floorGrad.addColorStop(0,'#111827');
-  floorGrad.addColorStop(1,'#0d1520');
-  ctx.fillStyle = floorGrad;
-  ctx.fillRect(0,0,W,H);
-
-  // グリッドライン（薄）
-  ctx.strokeStyle='rgba(77,150,255,0.06)'; ctx.lineWidth=1;
-  for(let x=0;x<W;x+=40){{ ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke(); }}
-  for(let y=0;y<H;y+=40){{ ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke(); }}
-
-  // 搬送路レーン（黄色破線）
-  ctx.setLineDash([14,8]); ctx.strokeStyle='rgba(255,217,61,0.25)'; ctx.lineWidth=18;
-  ctx.beginPath();
-  // メインレーン：横
-  ctx.moveTo(50,420); ctx.lineTo(750,420);
-  // 縦レーン
-  ctx.moveTo(200,420); ctx.lineTo(200,120);
-  ctx.moveTo(540,420); ctx.lineTo(540,120);
-  // 中間レーン
-  ctx.moveTo(200,260); ctx.lineTo(700,260);
-  ctx.stroke();
-  ctx.setLineDash([]);
-
-  // 棚（ライトブルーの矩形群）
-  const shelves = [
-    [280,80,80,80],[380,80,80,80],[480,80,80,80],
-    [280,160,80,80],[480,160,80,80],
-  ];
-  shelves.forEach(([sx,sy,sw,sh])=>{{
-    const g=ctx.createLinearGradient(sx,sy,sx,sy+sh);
-    g.addColorStop(0,'#1a3a5c'); g.addColorStop(1,'#0f2540');
-    ctx.fillStyle=g;
-    ctx.strokeStyle='rgba(77,150,255,0.3)'; ctx.lineWidth=1.5;
-    ctx.beginPath(); ctx.roundRect(sx,sy,sw,sh,4);
-    ctx.fill(); ctx.stroke();
-    // 棚板
-    for(let r=1;r<4;r++){{
-      ctx.strokeStyle='rgba(77,150,255,0.15)'; ctx.lineWidth=1;
-      ctx.beginPath(); ctx.moveTo(sx+4,sy+sh*r/4); ctx.lineTo(sx+sw-4,sy+sh*r/4); ctx.stroke();
-    }}
-    // ラベル
-    ctx.fillStyle='rgba(77,150,255,0.5)'; ctx.font='bold 9px monospace';
-    ctx.fillText('SHELF',sx+12,sy+sh/2+4);
-  }});
-
-  // 壁
-  ctx.strokeStyle='rgba(255,255,255,0.12)'; ctx.lineWidth=6;
-  ctx.strokeRect(3,3,W-6,H-6);
-  ctx.strokeStyle='rgba(255,255,255,0.05)'; ctx.lineWidth=2;
-  ctx.strokeRect(10,10,W-20,H-20);
-}}
-
-// ── ステーション描画 ──
-function drawStations() {{
-  stats.forEach(s=>{{
-    // 光るリング
-    const grd=ctx.createRadialGradient(s.x,s.y,4,s.x,s.y,28);
-    grd.addColorStop(0,'rgba(77,150,255,0.25)');
-    grd.addColorStop(1,'rgba(77,150,255,0)');
-    ctx.fillStyle=grd; ctx.beginPath(); ctx.arc(s.x,s.y,28,0,Math.PI*2); ctx.fill();
-
-    // 四角マーカー
-    ctx.fillStyle='#1a3060'; ctx.strokeStyle='#4d96ff'; ctx.lineWidth=2;
-    ctx.beginPath(); ctx.roundRect(s.x-20,s.y-14,40,28,5); ctx.fill(); ctx.stroke();
-
-    // テキスト
-    ctx.fillStyle='#aac4ff'; ctx.font='bold 9px "Segoe UI"'; ctx.textAlign='center';
-    const label = s.name.length > 6 ? s.name.slice(0,6)+'…' : s.name;
-    ctx.fillText(label,s.x,s.y+4);
-  }});
-}}
-
-// ── AGV 描画 ──
-function drawAGVs() {{
-  agvs.forEach(agv=>{{
-    const x=agv.x, y=agv.y;
-    const col=agv.color;
-
-    // 影
-    ctx.shadowColor=col; ctx.shadowBlur=14;
-
-    // 本体
-    const col2 = agv.status==='wait' ? '#ff4444' :
-                 agv.status==='dwell' ? '#ffd93d' : col;
-    ctx.fillStyle=col2;
-    ctx.strokeStyle='#fff'; ctx.lineWidth=1.5;
-    ctx.beginPath();
-    ctx.roundRect(x-14, y-10, 28, 20, 5);
-    ctx.fill(); ctx.stroke();
-
-    ctx.shadowBlur=0;
-
-    // ID テキスト
-    ctx.fillStyle='#fff'; ctx.font='bold 11px monospace';
-    ctx.textAlign='center'; ctx.textBaseline='middle';
-    ctx.fillText('T'+agv.id, x, y);
-
-    // ゴールへの矢印（薄）
-    ctx.strokeStyle=col+'55'; ctx.lineWidth=1; ctx.setLineDash([4,6]);
-    ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(agv.gx,agv.gy); ctx.stroke();
-    ctx.setLineDash([]);
-
-    // ゴールマーカー（小さい星型）
-    ctx.fillStyle=col+'88';
-    ctx.beginPath(); ctx.arc(agv.gx,agv.gy,4,0,Math.PI*2); ctx.fill();
-  }});
-}}
-
-drawFactory();
-drawStations();
-drawAGVs();
-</script>
-</body>
-</html>
-"""
-
-    components.html(factory_html, height=FACTORY_H + 60, scrolling=False)
-
-    # ステータス一覧
-    agv_cols = st.columns(5)
+    # AGV
+    colors = ["#e94560", "#00cfff", "#34c759", "#ff9f0a", "#bf5af2"]
     for i, agv in enumerate(st.session_state.agv_state):
-        status_icon = {"run":"🟢","dwell":"🟡","wait":"🔴"}.get(agv["status"],"⚫")
-        agv_cols[i].markdown(
-            f"<small style='color:{agv['color']}'><b>AGV{agv['id']}</b> {status_icon}<br>"
-            f"{agv['goal_name'][:6]}</small>",
-            unsafe_allow_html=True)
+        x, y  = agv["pos"]
+        gx, gy = agv["goal"]
+        marker = "X" if agv.get("wait", 0) > 0 else "o"   # 待機中は × 表示
+        ax.scatter(x,  y,  s=200, c=colors[i], marker=marker,
+                   zorder=7, edgecolors="white", linewidths=1,
+                   label=f"AGV{agv['id']}")
+        ax.scatter(gx, gy, s=80, c=colors[i], marker="*",
+                   alpha=0.4, zorder=4)
+        ax.annotate(
+            "", xy=(gx, gy), xytext=(x, y),
+            arrowprops=dict(arrowstyle="->", color=colors[i], alpha=0.3, lw=1)
+        )
+
+    ax.legend(
+        fontsize=9, loc="upper right",
+        facecolor="#1a2540", edgecolor="gray", labelcolor="white"
+    )
+    st.pyplot(fig, use_container_width=True)
+
+    st.markdown(
+        "<small style='color:#aac4ff'>"
+        "● 丸 = 走行中 　 × = 衝突回避待機 　 ☆ = 目標地点 　 □ = 機械（A/B/C）"
+        "</small>",
+        unsafe_allow_html=True
+    )
 
     st.markdown("</div>", unsafe_allow_html=True)
