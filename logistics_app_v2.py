@@ -193,20 +193,56 @@ def build_map(o_ll,d_ll,trucks,blocks,rkm,base_route):
     o_lat,o_lon=o_ll; d_lat,d_lon=d_ll
     m=folium.Map(location=[(o_lat+d_lat)/2,(o_lon+d_lon)/2],
                  zoom_start=6,tiles="CartoDB Positron",prefer_canvas=True)
+    # 通常ルート（灰色破線）
     if base_route:
-        folium.PolyLine(base_route,color="#aaaaaa",weight=4,dash_array="6,6",tooltip="通常ルート").add_to(m)
+        folium.PolyLine(base_route,color="#999999",weight=4,
+                        dash_array="8,6",opacity=0.7,
+                        tooltip="通常ルート（通行止め前）").add_to(m)
+    # 各トラックのルート
     for tk in (trucks or []):
         if not tk.get("route"): continue
-        folium.PolyLine(tk["route"],color=tk["color"],weight=6,opacity=0.95,
-                        tooltip=f"T{tk['id']} {tk['status']}").add_to(m)
-        prog=min(tk.get("progress",0),len(tk["route"])-1)
-        folium.CircleMarker(tk["route"][prog],radius=11,color=tk["color"],
-                            fill=True,fill_opacity=1,tooltip=f"T{tk['id']}").add_to(m)
+        col   = tk["color"]
+        label = {"run":"走行中","reroute":"迂回計算中","done":"到着済み"}.get(tk["status"],"---")
+        # 迂回ルートは太く実線、通常ルートは細め
+        weight  = 8 if tk.get("rerouted") else 5
+        opacity = 0.95 if tk.get("rerouted") else 0.75
+        folium.PolyLine(
+            tk["route"], color=col, weight=weight, opacity=opacity,
+            tooltip=f"T{tk['id']} {label}{'（迂回）' if tk.get('rerouted') else ''}",
+        ).add_to(m)
+        # 現在位置マーカー
+        prog = min(tk.get("progress",0), len(tk["route"])-1)
+        folium.CircleMarker(
+            tk["route"][prog], radius=12, color=col,
+            fill=True, fill_opacity=1,
+            tooltip=f"T{tk['id']} {label}",
+        ).add_to(m)
+        # 迂回済みラベル
+        if tk.get("rerouted") and len(tk["route"]) > 2:
+            mid = tk["route"][len(tk["route"])//2]
+            folium.Marker(
+                mid,
+                icon=folium.DivIcon(
+                    html=f'<div style="background:{col};color:#fff;padding:2px 6px;'
+                         f'border-radius:4px;font-size:11px;font-weight:bold;'
+                         f'white-space:nowrap;box-shadow:0 2px 4px rgba(0,0,0,0.3)">'
+                         f'T{tk["id"]}迂回中</div>',
+                    icon_size=(60,20), icon_anchor=(30,10)
+                )
+            ).add_to(m)
+    # 通行止め
     if blocks:
         for b_lat,b_lon in blocks:
             folium.Circle([b_lat,b_lon],radius=rkm*1000,color="#ff2222",
-                          fill=True,fill_opacity=0.3,tooltip="通行止め").add_to(m)
-            folium.Marker([b_lat,b_lon],icon=folium.Icon(icon="ban",prefix="fa",color="red")).add_to(m)
+                          fill=True,fill_opacity=0.25,
+                          tooltip=f"🚧 通行止め（半径{rkm}km）").add_to(m)
+            folium.Marker(
+                [b_lat,b_lon],
+                icon=folium.DivIcon(
+                    html='<div style="font-size:24px">🚧</div>',
+                    icon_size=(30,30), icon_anchor=(15,15)
+                )
+            ).add_to(m)
     folium.Marker([o_lat,o_lon],icon=folium.Icon(icon="play",prefix="fa",color="blue"),tooltip="出発").add_to(m)
     folium.Marker([d_lat,d_lon],icon=folium.Icon(icon="flag",prefix="fa",color="darkgreen"),tooltip="到着").add_to(m)
     return m.get_root().render()
@@ -314,7 +350,7 @@ if st.session_state.sim_running and not st.session_state.sim_done:
             prog=min(tk.get("progress",0),len(tk["route"])-1)
             cp=tk["route"][prog]
             res=find_detour(ak,(cp[0],cp[1]),d_ll,blocks,rkm,dtm)
-            if res: tk.update({"route":res["route"],"dist":res["dist"],"time":res["time"],"progress":0})
+            if res: tk.update({"route":res["route"],"dist":res["dist"],"time":res["time"],"progress":0,"rerouted":True})
             tk["status"]="run"; changed=True
         step=max(1,len(tk["route"])//40)
         tk["progress"]=min(tk["progress"]+step,len(tk["route"])-1)
@@ -364,346 +400,280 @@ with right:
     if st.button("AGV リセット"): st.session_state.agv_seed=random.randint(0,9999)
     init_data=make_agv_json(st.session_state.agv_seed)
 
-    # ── レーン定義をJSONで渡す ──
-    # 搬送路ノード（交差点・ステーション）とエッジ
-    lane_nodes = json.dumps([
-        {"id":0,"x":65, "y":385},  # 入荷
-        {"id":1,"x":185,"y":385},  # 交差点A
-        {"id":2,"x":185,"y":240},  # 交差点B
-        {"id":3,"x":185,"y":105},  # 充電
-        {"id":4,"x":350,"y":240},  # 交差点C
-        {"id":5,"x":520,"y":240},  # 交差点D
-        {"id":6,"x":520,"y":105},  # 上右
-        {"id":7,"x":520,"y":385},  # 交差点E
-        {"id":8,"x":665,"y":385},  # 出荷
-        {"id":9,"x":350,"y":385},  # 組立2下
-        {"id":10,"x":185,"y":300}, # 検品A
-        {"id":11,"x":350,"y":180}, # 組立1
-        {"id":12,"x":350,"y":330}, # 組立2
-        {"id":13,"x":520,"y":240}, # 品質検査（=交差点D）
-    ])
-    lane_edges = json.dumps([
-        [0,1],[1,2],[2,3],[2,4],[4,5],[5,6],[5,7],[7,8],[7,9],[1,10],[4,11],[4,12],[1,9]
-    ])
-    # ステーション→最近接ノードID
-    station_nodes = json.dumps([0,10,11,12,13,8,3])  # 入荷,検品A,組立1,組立2,品質検査,出荷,充電
-
-    factory_html=f"""<!DOCTYPE html>
+    factory_html="""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
-html,body{{margin:0;padding:0;width:100%;background:#eef2f7;font-family:'Segoe UI',sans-serif;overflow-x:hidden;}}
-canvas{{display:block;width:100%;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,100,0.2);}}
-.ctrl{{display:flex;gap:8px;padding:6px 4px 4px;}}
-.btn{{padding:6px 18px;border:none;border-radius:7px;font-weight:700;font-size:12px;cursor:pointer;color:#fff;}}
-.btn-go{{background:linear-gradient(90deg,#22aa44,#44cc88);}}
-.btn-st{{background:linear-gradient(90deg,#cc4422,#ee6644);}}
-.btn-rs{{background:linear-gradient(90deg,#4466cc,#6688ff);}}
-.info{{font-size:12px;color:#334;padding:2px 4px;font-weight:600;}}
-.sa-log{{font-size:10px;color:#446;background:#ddeeff;border-radius:6px;padding:3px 8px;margin:2px 4px;min-height:16px;}}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:#eef2f7;font-family:'Segoe UI',sans-serif;}
+.wrap{display:flex;flex-direction:column;align-items:stretch;}
+.ctrl{display:flex;gap:6px;padding:6px;}
+.btn{padding:6px 16px;border:none;border-radius:6px;font-weight:700;
+     font-size:12px;cursor:pointer;color:#fff;}
+.go{background:#22aa44;} .st{background:#cc4422;} .rs{background:#4466cc;}
+canvas{display:block;width:100%;height:auto;}
+.log{font-size:10px;color:#446;background:#ddeeff;padding:3px 8px;
+     border-radius:4px;margin:3px 6px;min-height:16px;}
+.inf{font-size:11px;color:#334;padding:2px 6px;font-weight:600;}
 </style></head>
-<body>
+<body><div class="wrap">
 <div class="ctrl">
-  <button class="btn btn-go" onclick="running=true;drawOnce()">▶ 開始</button>
-  <button class="btn btn-st" onclick="running=false">■ 停止</button>
-  <button class="btn btn-rs" onclick="resetAll()">↺ リセット</button>
+  <button class="btn go" onclick="start()">▶ 開始</button>
+  <button class="btn st" onclick="stop()">■ 停止</button>
+  <button class="btn rs" onclick="reset()">↺ リセット</button>
 </div>
-<canvas id="c"></canvas>
-<div class="info" id="info">Time = 0　|　緑▶=走行　黄=作業中　赤=衝突待機</div>
-<div class="sa-log" id="salog">▶開始 を押してください</div>
+<canvas id="cv" width="720" height="430"></canvas>
+<div class="inf" id="inf">Time = 0 | 緑▶走行 黄⚙作業中 赤⏸衝突待機</div>
+<div class="log" id="log">▶開始 を押してください</div>
+</div>
 <script>
-const cv=document.getElementById('c');
-const CTX=cv.getContext('2d');
-function resize(){{cv.width=document.body.clientWidth||660;cv.height=Math.round(cv.width*440/740);}}
-resize();
-window.addEventListener('resize',resize);
-const sx=()=>cv.width/740, sy=()=>cv.height/440;
-const ctx={{
-  get canvas(){{return cv;}},
-  beginPath:()=>CTX.beginPath(),
-  closePath:()=>CTX.closePath(),
-  fill:()=>CTX.fill(),
-  stroke:()=>CTX.stroke(),
-  arc:(x,y,r,s,e)=>CTX.arc(x*sx(),y*sy(),r*Math.min(sx(),sy()),s,e),
-  moveTo:(x,y)=>CTX.moveTo(x*sx(),y*sy()),
-  lineTo:(x,y)=>CTX.lineTo(x*sx(),y*sy()),
-  fillRect:(x,y,w,h)=>CTX.fillRect(x*sx(),y*sy(),w*sx(),h*sy()),
-  strokeRect:(x,y,w,h)=>CTX.strokeRect(x*sx(),y*sy(),w*sx(),h*sy()),
-  quadraticCurveTo:(cpx,cpy,x,y)=>CTX.quadraticCurveTo(cpx*sx(),cpy*sy(),x*sx(),y*sy()),
-  ellipse:(x,y,rx,ry,rot,s,e)=>CTX.ellipse(x*sx(),y*sy(),rx*sx(),ry*sy(),rot,s,e),
-  createLinearGradient:(x0,y0,x1,y1)=>CTX.createLinearGradient(x0*sx(),y0*sy(),x1*sx(),y1*sy()),
-  createRadialGradient:(x0,y0,r0,x1,y1,r1)=>CTX.createRadialGradient(x0*sx(),y0*sy(),r0*Math.min(sx(),sy()),x1*sx(),y1*sy(),r1*Math.min(sx(),sy())),
-  fillText:(t,x,y)=>CTX.fillText(t,x*sx(),y*sy()),
-  measureText:(t)=>CTX.measureText(t),
-  setLineDash:(a)=>CTX.setLineDash(a),
-  get fillStyle(){{return CTX.fillStyle;}}, set fillStyle(v){{CTX.fillStyle=v;}},
-  get strokeStyle(){{return CTX.strokeStyle;}}, set strokeStyle(v){{CTX.strokeStyle=v;}},
-  get lineWidth(){{return CTX.lineWidth;}}, set lineWidth(v){{CTX.lineWidth=v*Math.min(sx(),sy());}},
-  get font(){{return CTX.font;}}, set font(v){{CTX.font=v;}},
-  get textAlign(){{return CTX.textAlign;}}, set textAlign(v){{CTX.textAlign=v;}},
-  get textBaseline(){{return CTX.textBaseline;}}, set textBaseline(v){{CTX.textBaseline=v;}},
-  get shadowColor(){{return CTX.shadowColor;}}, set shadowColor(v){{CTX.shadowColor=v;}},
-  get shadowBlur(){{return CTX.shadowBlur;}}, set shadowBlur(v){{CTX.shadowBlur=v;}},
-  get shadowOffsetY(){{return CTX.shadowOffsetY;}}, set shadowOffsetY(v){{CTX.shadowOffsetY=v;}},
-}};
+const cv=document.getElementById('cv');
+const ctx=cv.getContext('2d');
+// 実座標系: 720x430 固定、CSSで幅100%に伸縮
 
-// ── レーンノード・エッジ ──
-const NODES={lane_nodes};
-const EDGES={lane_edges};
-const ST_NODES={station_nodes};
+// レーンノード
+const N=[
+  {x:60, y:390},{x:180,y:390},{x:180,y:240},{x:180,y:100},
+  {x:350,y:240},{x:510,y:240},{x:510,y:100},{x:510,y:390},
+  {x:660,y:390},{x:350,y:390},{x:180,y:295},{x:350,y:175},
+  {x:350,y:325},{x:510,y:240}
+];
+const E=[[0,1],[1,2],[2,3],[2,4],[4,5],[5,6],[5,7],[7,8],[7,9],[1,10],[4,11],[4,12],[1,9],[9,7]];
+const ST_N=[0,10,11,12,13,8,3];
+const ST_NAME=["入荷","検品A","組立1","組立2","品質検査","出荷","充電"];
+const COLORS=["#e53935","#f9a825","#2e7d32","#1565c0","#6a1b9a"];
 
 // 隣接リスト
-const ADJ=NODES.map(()=>[]);
-EDGES.forEach(([a,b])=>{{ADJ[a].push(b);ADJ[b].push(a);}});
+const ADJ=N.map(()=>[]);
+E.forEach(([a,b])=>{ADJ[a].push(b);ADJ[b].push(a);});
 
-// ── ダイクストラ（ノード間最短経路） ──
-function dijkstra(src,dst){{
-  const dist=NODES.map(()=>Infinity),prev=NODES.map(()=>-1);
-  dist[src]=0;
-  const Q=new Set(NODES.map((_,i)=>i));
-  while(Q.size){{
-    let u=-1;
-    Q.forEach(n=>{{if(u<0||dist[n]<dist[u])u=n;}});
-    if(u===dst||dist[u]===Infinity)break;
-    Q.delete(u);
-    ADJ[u].forEach(v=>{{
-      const nd=NODES[u],nv=NODES[v];
-      const w=Math.hypot(nd.x-nv.x,nd.y-nv.y);
-      if(dist[u]+w<dist[v]){{dist[v]=dist[u]+w;prev[v]=u;}}
-    }});
-  }}
-  // 経路復元
-  const path=[];let cur=dst;
-  while(cur>=0){{path.unshift(cur);cur=prev[cur];}}
-  return path.length>1?path:null;
-}}
+// ダイクストラ
+function dijkstra(s,t){
+  const d=N.map(()=>1e9),p=N.map(()=>-1);
+  d[s]=0;const Q=new Set(N.map((_,i)=>i));
+  while(Q.size){
+    let u=-1;Q.forEach(n=>{if(u<0||d[n]<d[u])u=n;});
+    if(u===t||d[u]===1e9)break;Q.delete(u);
+    ADJ[u].forEach(v=>{
+      const w=Math.hypot(N[u].x-N[v].x,N[u].y-N[v].y);
+      if(d[u]+w<d[v]){d[v]=d[u]+w;p[v]=u;}
+    });
+  }
+  const path=[];let c=t;
+  while(c>=0){path.unshift(c);c=p[c];}
+  return path.length>1?path:[s];
+}
 
-// ── SA による次目的地選択 ──
-const saLog=document.getElementById('salog');
-function saSelect(agv){{
-  const n=ST_NODES.length;
-  const costs=ST_NODES.map((ni,si)=>{{
-    const nd=NODES[ni];
-    const dist=Math.hypot(agv.x-nd.x,agv.y-nd.y);
-    // コスト：距離＋混雑ペナルティ（他AGVが向かっている場合）
-    const congestion=agvs.filter(o=>o.id!==agv.id&&o.goalSt===si).length*200;
-    return dist+congestion;
-  }});
-  let cur=Math.floor(Math.random()*n),best=cur,T=80;
-  for(let i=0;i<150;i++){{
-    const nxt=Math.floor(Math.random()*n);
-    const d=costs[nxt]-costs[cur];
-    if(d<0||Math.random()<Math.exp(-d/Math.max(T,0.1)))cur=nxt;
-    if(costs[cur]<costs[best])best=cur;
-    T*=0.95;
-  }}
-  const stNames=['入荷','検品A','組立1','組立2','品質検査','出荷','充電'];
-  saLog.textContent='SA最適化：AGV'+agv.id+' → '+stNames[best]
-    +' (コスト:'+Math.round(costs[best])+' / T終了:'+T.toFixed(1)+')';
+// SA目的地選択
+function saSelect(agv){
+  const n=ST_N.length;
+  const costs=ST_N.map((ni,si)=>{
+    const dist=Math.hypot(agv.x-N[ni].x,agv.y-N[ni].y);
+    const busy=agvs.filter(o=>o.id!==agv.id&&o.goalSt===si).length*150;
+    return dist+busy;
+  });
+  let cur=Math.floor(Math.random()*n),best=cur,T=100;
+  for(let i=0;i<200;i++){
+    const nx=Math.floor(Math.random()*n),d=costs[nx]-costs[cur];
+    if(d<0||Math.random()<Math.exp(-d/Math.max(T,0.1)))cur=nx;
+    if(costs[cur]<costs[best])best=cur;T*=0.95;
+  }
+  document.getElementById('log').textContent=
+    'SA：AGV'+agv.id+'→'+ST_NAME[best]+
+    ' (コスト:'+Math.round(costs[best])+' 温度終了:'+T.toFixed(1)+')';
   return best;
-}}
+}
 
-// ── AGV初期化 ──
-const INIT={init_data};
-const AGV_COLORS=INIT.agvs.map(a=>a.color);
-let agvs,running=false,tick=0;
+// AGV初期化
+""" + f"const INIT={init_data};" + """
+let agvs=[],running=false,tick=0;
 
-function makeAGV(){{
-  return INIT.agvs.map((a,i)=>{{
-    const startNode=i%NODES.length;
-    const goalSt=saSelect({{id:a.id,x:NODES[startNode].x,y:NODES[startNode].y,goalSt:-1}});
-    const path=dijkstra(startNode,ST_NODES[goalSt])||[startNode];
-    return{{
-      id:a.id,color:a.color,
-      x:NODES[startNode].x,y:NODES[startNode].y,
-      path:path,pathIdx:0,
-      goalSt:goalSt,speed:3.5,
+function initAGV(){
+  agvs=INIT.agvs.map((a,i)=>{
+    const sn=i%N.length;
+    const gs=i%ST_N.length;
+    const path=dijkstra(sn,ST_N[gs]);
+    return{id:a.id,color:COLORS[i%5],
+      x:N[sn].x,y:N[sn].y,
+      path,pi:0,goalSt:gs,
+      speed:3.2+i*0.15,
       dwell:0,wait:0,status:'run',
-      trail:[]
-    }};
-  }});
-}}
-function resetAll(){{agvs=makeAGV();tick=0;running=false;
-  saLog.textContent='SA最適化ログ：待機中...';}}
-agvs=makeAGV();
+      trail:[]};
+  });
+}
 
-// ── AGVステップ ──
-function stepAGVs(){{
-  agvs.forEach(a=>{{
-    // 軌跡記録
-    a.trail.push({{x:a.x,y:a.y}});
-    if(a.trail.length>30)a.trail.shift();
+function reset(){initAGV();tick=0;running=false;
+  document.getElementById('log').textContent='▶開始 を押してください';
+  draw();}
+function start(){running=true;}
+function stop(){running=false;}
+initAGV();
 
-    if(a.dwell>0){{
+// ステップ
+function stepAGV(){
+  agvs.forEach(a=>{
+    a.trail.push({x:a.x,y:a.y});
+    if(a.trail.length>25)a.trail.shift();
+    if(a.dwell>0){
       a.dwell--;a.status='dwell';
-      if(a.dwell===0){{
-        // SA で次の目的地を決定
+      if(a.dwell===0){
         a.goalSt=saSelect(a);
-        const curNode=a.path[a.path.length-1]||0;
-        const newPath=dijkstra(curNode,ST_NODES[a.goalSt]);
-        if(newPath){{a.path=newPath;a.pathIdx=0;}}
+        const cn=a.path[a.path.length-1]||0;
+        const np=dijkstra(cn,ST_N[a.goalSt]);
+        if(np&&np.length>1){a.path=np;a.pi=0;}
         a.status='run';
-      }}
-      return;
-    }}
-    if(a.wait>0){{a.wait--;a.status=a.wait>0?'wait':'run';return;}}
-
-    // 次ノードへ移動
-    if(a.pathIdx>=a.path.length-1){{
-      // ゴール到達
-      a.x=NODES[a.path[a.path.length-1]].x;
-      a.y=NODES[a.path[a.path.length-1]].y;
+      }return;
+    }
+    if(a.wait>0){a.wait--;a.status=a.wait>0?'wait':'run';return;}
+    if(a.pi>=a.path.length-1){
+      a.x=N[a.path[a.path.length-1]].x;
+      a.y=N[a.path[a.path.length-1]].y;
       a.dwell=20+Math.floor(Math.random()*20);
       a.status='dwell';return;
-    }}
-    const target=NODES[a.path[a.pathIdx+1]];
-    const dx=target.x-a.x,dy=target.y-a.y,d=Math.hypot(dx,dy);
-    if(d<a.speed+1){{
-      a.x=target.x;a.y=target.y;a.pathIdx++;
-    }}else{{
-      a.x+=a.speed*dx/d;a.y+=a.speed*dy/d;
-    }}
+    }
+    const tgt=N[a.path[a.pi+1]];
+    const dx=tgt.x-a.x,dy=tgt.y-a.y,d=Math.hypot(dx,dy);
+    if(d<a.speed+1){a.x=tgt.x;a.y=tgt.y;a.pi++;}
+    else{a.x+=a.speed*dx/d;a.y+=a.speed*dy/d;}
     a.status='run';
-  }});
-
-  // 衝突回避（同じノード付近）
-  for(let i=0;i<agvs.length;i++){{
-    for(let j=i+1;j<agvs.length;j++){{
+  });
+  // 衝突回避
+  for(let i=0;i<agvs.length;i++)
+    for(let j=i+1;j<agvs.length;j++){
       const a=agvs[i],b=agvs[j];
-      if(Math.hypot(a.x-b.x,a.y-b.y)<32&&a.status==='run'&&b.status==='run'){{
-        // 後着（IDが大きい方）を待機
-        b.wait=3+Math.floor(Math.random()*4);b.status='wait';
-      }}
-    }}
-  }}
+      if(Math.hypot(a.x-b.x,a.y-b.y)<30&&a.status==='run'&&b.status==='run')
+        {b.wait=2+Math.floor(Math.random()*3);b.status='wait';}
+    }
   tick++;
-}}
+}
 
-// ── 角丸矩形 ──
-function rr(x,y,w,h,r){{
-  ctx.beginPath();ctx.moveTo(x+r,y);ctx.lineTo(x+w-r,y);
-  ctx.quadraticCurveTo(x+w,y,x+w,y+r);ctx.lineTo(x+w,y+h-r);
-  ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);ctx.lineTo(x+r,y+h);
-  ctx.quadraticCurveTo(x,y+h,x,y+h-r);ctx.lineTo(x,y+r);
-  ctx.quadraticCurveTo(x,y,x+r,y);ctx.closePath();
-}}
+// 角丸矩形
+function rr(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);ctx.closePath();
+}
 
-// ── 描画 ──
-function draw(){{
+// 描画
+function draw(){
+  const W=720,H=430;
   // 床
-  const g=ctx.createLinearGradient(0,0,0,H);
-  g.addColorStop(0,'#eef2f7');g.addColorStop(1,'#dde4ee');
-  ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
-
+  ctx.fillStyle='#eef2f7';ctx.fillRect(0,0,W,H);
   // グリッド
-  ctx.strokeStyle='rgba(100,130,180,0.15)';ctx.lineWidth=1;
-  for(let x=0;x<W;x+=40){{ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}}
-  for(let y=0;y<H;y+=40){{ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}}
+  ctx.strokeStyle='rgba(100,130,180,0.12)';ctx.lineWidth=1;
+  for(let x=0;x<W;x+=40){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}
+  for(let y=0;y<H;y+=40){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
 
-  // 搬送路レーン（実線＋中心線）
-  ctx.strokeStyle='rgba(210,170,0,0.35)';ctx.lineWidth=28;ctx.setLineDash([]);
+  // 搬送路（太い黄色実線）
+  ctx.strokeStyle='rgba(220,175,0,0.4)';ctx.lineWidth=26;ctx.setLineDash([]);
   ctx.beginPath();
-  ctx.moveTo(45,385);ctx.lineTo(700,385);
-  ctx.moveTo(185,385);ctx.lineTo(185,105);
-  ctx.moveTo(520,385);ctx.lineTo(520,105);
-  ctx.moveTo(185,240);ctx.lineTo(665,240);
+  ctx.moveTo(60,390);ctx.lineTo(660,390);
+  ctx.moveTo(180,390);ctx.lineTo(180,100);
+  ctx.moveTo(510,390);ctx.lineTo(510,100);
+  ctx.moveTo(180,240);ctx.lineTo(660,240);
   ctx.stroke();
-  // 中心線（白破線）
-  ctx.strokeStyle='rgba(255,255,255,0.7)';ctx.lineWidth=2;ctx.setLineDash([10,8]);
+  // 中心白破線
+  ctx.strokeStyle='rgba(255,255,255,0.8)';ctx.lineWidth=2;ctx.setLineDash([10,8]);
   ctx.beginPath();
-  ctx.moveTo(45,385);ctx.lineTo(700,385);
-  ctx.moveTo(185,385);ctx.lineTo(185,105);
-  ctx.moveTo(520,385);ctx.lineTo(520,105);
-  ctx.moveTo(185,240);ctx.lineTo(665,240);
+  ctx.moveTo(60,390);ctx.lineTo(660,390);
+  ctx.moveTo(180,390);ctx.lineTo(180,100);
+  ctx.moveTo(510,390);ctx.lineTo(510,100);
+  ctx.moveTo(180,240);ctx.lineTo(660,240);
   ctx.stroke();ctx.setLineDash([]);
 
   // 棚
-  [[280,62,70,70],[358,62,70,70],[436,62,70,70],[280,145,70,70],[436,145,70,70]].forEach(([sx,sy,sw,sh])=>{{
-    const sg=ctx.createLinearGradient(sx,sy,sx,sy+sh);
-    sg.addColorStop(0,'#c8ddf5');sg.addColorStop(1,'#9abde0');
-    ctx.fillStyle=sg;ctx.strokeStyle='#4477bb';ctx.lineWidth=1.5;
+  [[285,60,65,65],[355,60,65,65],[425,60,65,65],
+   [285,140,65,65],[425,140,65,65]].forEach(([sx,sy,sw,sh])=>{
+    const g=ctx.createLinearGradient(sx,sy,sx,sy+sh);
+    g.addColorStop(0,'#c5ddf5');g.addColorStop(1,'#9cc0e5');
+    ctx.fillStyle=g;ctx.strokeStyle='#4477bb';ctx.lineWidth=1.5;
     rr(sx,sy,sw,sh,5);ctx.fill();ctx.stroke();
-    // 棚板
-    for(let r=1;r<3;r++){{
-      ctx.strokeStyle='rgba(50,100,180,0.3)';ctx.lineWidth=1;
+    for(let r=1;r<3;r++){
+      ctx.strokeStyle='rgba(60,100,180,0.25)';ctx.lineWidth=1;
       ctx.beginPath();ctx.moveTo(sx+4,sy+sh*r/3);ctx.lineTo(sx+sw-4,sy+sh*r/3);ctx.stroke();
-    }}
+    }
     ctx.fillStyle='#1a4070';ctx.font='bold 8px monospace';
-    ctx.textAlign='center';ctx.fillText('SHELF',sx+sw/2,sy+sh/2+3);
-  }});
+    ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText('SHELF',sx+sw/2,sy+sh/2);
+  });
 
   // 外壁
-  ctx.strokeStyle='rgba(50,70,120,0.5)';ctx.lineWidth=5;ctx.strokeRect(3,3,W-6,H-6);
+  ctx.strokeStyle='rgba(50,70,120,0.45)';ctx.lineWidth=5;
+  ctx.strokeRect(3,3,W-6,H-6);
 
   // ステーション
-  const stNames=['入荷','検品A','組立1','組立2','品質検査','出荷','充電'];
-  ST_NODES.forEach((ni,si)=>{{
-    const n=NODES[ni];
+  ST_N.forEach((ni,si)=>{
+    const n=N[ni];
     const active=agvs.some(a=>a.goalSt===si&&a.status==='dwell');
-    const glow=ctx.createRadialGradient(n.x,n.y,2,n.x,n.y,28);
-    glow.addColorStop(0,active?'rgba(255,200,0,0.5)':'rgba(50,120,255,0.2)');
-    glow.addColorStop(1,'rgba(0,0,255,0)');
-    ctx.fillStyle=glow;ctx.beginPath();ctx.arc(n.x,n.y,28,0,Math.PI*2);ctx.fill();
-    ctx.fillStyle=active?'#fff8cc':'#ddeeff';
+    ctx.fillStyle=active?'#fff5cc':'#ddeeff';
     ctx.strokeStyle=active?'#cc8800':'#2266cc';ctx.lineWidth=2.5;
     rr(n.x-26,n.y-16,52,32,7);ctx.fill();ctx.stroke();
+    // グロー
+    if(active){
+      const g2=ctx.createRadialGradient(n.x,n.y,2,n.x,n.y,30);
+      g2.addColorStop(0,'rgba(255,200,0,0.3)');
+      g2.addColorStop(1,'rgba(255,200,0,0)');
+      ctx.fillStyle=g2;ctx.beginPath();ctx.arc(n.x,n.y,30,0,Math.PI*2);ctx.fill();
+    }
     ctx.fillStyle='#003388';ctx.font='bold 10px "Segoe UI"';
-    ctx.textAlign='center';ctx.fillText(stNames[si],n.x,n.y+4);
-  }});
+    ctx.textAlign='center';ctx.textBaseline='middle';
+    ctx.fillText(ST_NAME[si],n.x,n.y);
+  });
 
-  // AGV軌跡＆本体
-  agvs.forEach(a=>{{
+  // AGV軌跡 & 本体
+  agvs.forEach(a=>{
     // 軌跡
-    if(a.trail.length>1){{
+    if(a.trail.length>1){
       ctx.beginPath();ctx.moveTo(a.trail[0].x,a.trail[0].y);
       a.trail.forEach(p=>ctx.lineTo(p.x,p.y));
-      ctx.strokeStyle=a.color+'55';ctx.lineWidth=3;ctx.setLineDash([]);ctx.stroke();
-    }}
-
-    // ゴールへの点線
-    const gn=NODES[ST_NODES[a.goalSt]];
-    ctx.strokeStyle=a.color+'88';ctx.lineWidth=1.5;ctx.setLineDash([5,7]);
+      ctx.strokeStyle=a.color+'55';ctx.lineWidth=3;ctx.stroke();
+    }
+    // ゴール破線
+    const gn=N[ST_N[a.goalSt]];
+    ctx.strokeStyle=a.color+'66';ctx.lineWidth=1.5;ctx.setLineDash([5,7]);
     ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(gn.x,gn.y);ctx.stroke();
     ctx.setLineDash([]);
+    // ゴール★
+    ctx.fillStyle=a.color+'99';ctx.beginPath();ctx.arc(gn.x,gn.y,5,0,Math.PI*2);ctx.fill();
 
-    // AGV本体（大きめ）
+    // AGV本体
     const col=a.status==='wait'?'#dd2222':a.status==='dwell'?'#dd9900':a.color;
-    ctx.shadowColor='rgba(0,0,0,0.35)';ctx.shadowBlur=10;ctx.shadowOffsetY=3;
-    ctx.fillStyle=col;ctx.strokeStyle='white';ctx.lineWidth=2.5;
-    rr(a.x-18,a.y-13,36,26,7);ctx.fill();ctx.stroke();
+    ctx.shadowColor='rgba(0,0,0,0.3)';ctx.shadowBlur=8;ctx.shadowOffsetY=3;
+    ctx.fillStyle=col;ctx.strokeStyle='#fff';ctx.lineWidth=2.5;
+    rr(a.x-18,a.y-12,36,24,6);ctx.fill();ctx.stroke();
     ctx.shadowBlur=0;ctx.shadowOffsetY=0;
-
-    // AGV内：ホイール
-    [[-8,9],[8,9],[-8,-9],[8,-9]].forEach(([wx,wy])=>{{
-      ctx.fillStyle='#333';ctx.beginPath();
-      ctx.ellipse(a.x+wx,a.y+wy,4,3,0,0,Math.PI*2);ctx.fill();
-    }});
-
-    // AGV内：ID
+    // ホイール
+    ctx.fillStyle='#333';
+    [[-9,10],[9,10],[-9,-10],[9,-10]].forEach(([wx,wy])=>{
+      ctx.beginPath();ctx.ellipse(a.x+wx,a.y+wy,4,2.5,0,0,Math.PI*2);ctx.fill();
+    });
+    // ID
     ctx.fillStyle='#fff';ctx.font='bold 11px monospace';
     ctx.textAlign='center';ctx.textBaseline='middle';
     ctx.fillText('A'+a.id,a.x,a.y);
-
     // ステータスアイコン
     const icon=a.status==='wait'?'⏸':a.status==='dwell'?'⚙':'▶';
-    ctx.font='10px serif';ctx.fillText(icon,a.x+14,a.y-12);
-  }});
+    ctx.font='9px serif';ctx.fillText(icon,a.x+16,a.y-14);
+  });
   ctx.textBaseline='alphabetic';
+  document.getElementById('inf').textContent=
+    'Time='+tick+' | 緑▶走行 黄⚙作業中 赤⏸衝突待機';
+}
 
-  document.getElementById('info').textContent=
-    'Time='+tick+'　|　緑▶=走行　黄⚙=作業中　赤⏸=衝突待機';
-}}
-
+// ループ
 let last=0;
-function loop(ts){{
-  if(running&&ts-last>100){{stepAGVs();last=ts;}}
-  draw();requestAnimationFrame(loop);
-}}
+function loop(ts){
+  if(running&&ts-last>100){stepAGV();last=ts;}
+  draw();
+  requestAnimationFrame(loop);
+}
+draw(); // 初回描画
 requestAnimationFrame(loop);
 </script></body></html>"""
 
-    st.iframe(factory_html, height=580, width="stretch")
+    st.iframe(factory_html, height=530, width="stretch")
     st.markdown(
         '<small style="color:#8899bb">'
-        '▶開始 で AGV がレーン沿いに走行開始。SA が次目的地を自動選択し、ログに表示します。'
+        '▶開始でAGVがレーン沿いに走行。SAが次目的地を自動選択しログに表示します。'
         '</small>', unsafe_allow_html=True)
-    st.markdown("</div>",unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
