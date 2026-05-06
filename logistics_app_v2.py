@@ -391,31 +391,60 @@ with right:
     factory_html=f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
-body{{margin:0;background:#f0f4f8;display:flex;flex-direction:column;
-     align-items:center;font-family:'Segoe UI',sans-serif;padding:4px 0;}}
-canvas{{border-radius:12px;box-shadow:0 4px 20px rgba(0,0,100,0.2);display:block;}}
-.ctrl{{display:flex;gap:8px;margin:4px 0 6px;}}
-.btn{{padding:5px 16px;border:none;border-radius:7px;font-weight:700;font-size:12px;
-      cursor:pointer;color:#fff;box-shadow:0 2px 6px rgba(0,0,0,0.2);}}
+html,body{{margin:0;padding:0;width:100%;background:#eef2f7;font-family:'Segoe UI',sans-serif;overflow-x:hidden;}}
+canvas{{display:block;width:100%;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,100,0.2);}}
+.ctrl{{display:flex;gap:8px;padding:6px 4px 4px;}}
+.btn{{padding:6px 18px;border:none;border-radius:7px;font-weight:700;font-size:12px;cursor:pointer;color:#fff;}}
 .btn-go{{background:linear-gradient(90deg,#22aa44,#44cc88);}}
 .btn-st{{background:linear-gradient(90deg,#cc4422,#ee6644);}}
 .btn-rs{{background:linear-gradient(90deg,#4466cc,#6688ff);}}
-.info{{font-size:12px;color:#334;margin:3px 0;font-weight:600;}}
-.sa-log{{font-size:10px;color:#446;background:#e8f0ff;border-radius:6px;
-         padding:3px 8px;margin:2px 0;min-height:18px;max-width:740px;}}
+.info{{font-size:12px;color:#334;padding:2px 4px;font-weight:600;}}
+.sa-log{{font-size:10px;color:#446;background:#ddeeff;border-radius:6px;padding:3px 8px;margin:2px 4px;min-height:16px;}}
 </style></head>
 <body>
 <div class="ctrl">
-  <button class="btn btn-go" onclick="running=true">▶ 開始</button>
+  <button class="btn btn-go" onclick="running=true;drawOnce()">▶ 開始</button>
   <button class="btn btn-st" onclick="running=false">■ 停止</button>
   <button class="btn btn-rs" onclick="resetAll()">↺ リセット</button>
 </div>
-<canvas id="c" width="740" height="440"></canvas>
-<div class="info" id="info">Time = 0　|　緑=走行　黄=作業中　赤=衝突待機</div>
-<div class="sa-log" id="salog">SA最適化ログ：待機中...</div>
+<canvas id="c"></canvas>
+<div class="info" id="info">Time = 0　|　緑▶=走行　黄=作業中　赤=衝突待機</div>
+<div class="sa-log" id="salog">▶開始 を押してください</div>
 <script>
-const W=740,H=440;
-const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+const cv=document.getElementById('c');
+const CTX=cv.getContext('2d');
+function resize(){{cv.width=document.body.clientWidth||660;cv.height=Math.round(cv.width*440/740);}}
+resize();
+window.addEventListener('resize',resize);
+const sx=()=>cv.width/740, sy=()=>cv.height/440;
+const ctx={{
+  get canvas(){{return cv;}},
+  beginPath:()=>CTX.beginPath(),
+  closePath:()=>CTX.closePath(),
+  fill:()=>CTX.fill(),
+  stroke:()=>CTX.stroke(),
+  arc:(x,y,r,s,e)=>CTX.arc(x*sx(),y*sy(),r*Math.min(sx(),sy()),s,e),
+  moveTo:(x,y)=>CTX.moveTo(x*sx(),y*sy()),
+  lineTo:(x,y)=>CTX.lineTo(x*sx(),y*sy()),
+  fillRect:(x,y,w,h)=>CTX.fillRect(x*sx(),y*sy(),w*sx(),h*sy()),
+  strokeRect:(x,y,w,h)=>CTX.strokeRect(x*sx(),y*sy(),w*sx(),h*sy()),
+  quadraticCurveTo:(cpx,cpy,x,y)=>CTX.quadraticCurveTo(cpx*sx(),cpy*sy(),x*sx(),y*sy()),
+  ellipse:(x,y,rx,ry,rot,s,e)=>CTX.ellipse(x*sx(),y*sy(),rx*sx(),ry*sy(),rot,s,e),
+  createLinearGradient:(x0,y0,x1,y1)=>CTX.createLinearGradient(x0*sx(),y0*sy(),x1*sx(),y1*sy()),
+  createRadialGradient:(x0,y0,r0,x1,y1,r1)=>CTX.createRadialGradient(x0*sx(),y0*sy(),r0*Math.min(sx(),sy()),x1*sx(),y1*sy(),r1*Math.min(sx(),sy())),
+  fillText:(t,x,y)=>CTX.fillText(t,x*sx(),y*sy()),
+  measureText:(t)=>CTX.measureText(t),
+  setLineDash:(a)=>CTX.setLineDash(a),
+  get fillStyle(){{return CTX.fillStyle;}}, set fillStyle(v){{CTX.fillStyle=v;}},
+  get strokeStyle(){{return CTX.strokeStyle;}}, set strokeStyle(v){{CTX.strokeStyle=v;}},
+  get lineWidth(){{return CTX.lineWidth;}}, set lineWidth(v){{CTX.lineWidth=v*Math.min(sx(),sy());}},
+  get font(){{return CTX.font;}}, set font(v){{CTX.font=v;}},
+  get textAlign(){{return CTX.textAlign;}}, set textAlign(v){{CTX.textAlign=v;}},
+  get textBaseline(){{return CTX.textBaseline;}}, set textBaseline(v){{CTX.textBaseline=v;}},
+  get shadowColor(){{return CTX.shadowColor;}}, set shadowColor(v){{CTX.shadowColor=v;}},
+  get shadowBlur(){{return CTX.shadowBlur;}}, set shadowBlur(v){{CTX.shadowBlur=v;}},
+  get shadowOffsetY(){{return CTX.shadowOffsetY;}}, set shadowOffsetY(v){{CTX.shadowOffsetY=v;}},
+}};
 
 // ── レーンノード・エッジ ──
 const NODES={lane_nodes};
@@ -672,7 +701,7 @@ function loop(ts){{
 requestAnimationFrame(loop);
 </script></body></html>"""
 
-    st.iframe(factory_html, height=560, width="stretch")
+    st.iframe(factory_html, height=580, width="stretch")
     st.markdown(
         '<small style="color:#8899bb">'
         '▶開始 で AGV がレーン沿いに走行開始。SA が次目的地を自動選択し、ログに表示します。'
