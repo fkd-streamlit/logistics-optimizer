@@ -192,20 +192,20 @@ TRUCK_COLORS=["#ff6b6b","#ffd93d","#6bcb77"]
 def build_map(o_ll,d_ll,trucks,blocks,rkm,base_route):
     o_lat,o_lon=o_ll; d_lat,d_lon=d_ll
     m=folium.Map(location=[(o_lat+d_lat)/2,(o_lon+d_lon)/2],
-                 zoom_start=6,tiles="CartoDB DarkMatter",prefer_canvas=True)
+                 zoom_start=6,tiles="CartoDB Positron",prefer_canvas=True)
     if base_route:
-        folium.PolyLine(base_route,color="#555",weight=3,dash_array="6,6",tooltip="通常ルート").add_to(m)
+        folium.PolyLine(base_route,color="#aaaaaa",weight=4,dash_array="6,6",tooltip="通常ルート").add_to(m)
     for tk in (trucks or []):
         if not tk.get("route"): continue
-        folium.PolyLine(tk["route"],color=tk["color"],weight=5,opacity=0.85,
+        folium.PolyLine(tk["route"],color=tk["color"],weight=6,opacity=0.95,
                         tooltip=f"T{tk['id']} {tk['status']}").add_to(m)
         prog=min(tk.get("progress",0),len(tk["route"])-1)
-        folium.CircleMarker(tk["route"][prog],radius=9,color=tk["color"],
+        folium.CircleMarker(tk["route"][prog],radius=11,color=tk["color"],
                             fill=True,fill_opacity=1,tooltip=f"T{tk['id']}").add_to(m)
     if blocks:
         for b_lat,b_lon in blocks:
-            folium.Circle([b_lat,b_lon],radius=rkm*1000,color="#ff4444",
-                          fill=True,fill_opacity=0.2,tooltip="通行止め").add_to(m)
+            folium.Circle([b_lat,b_lon],radius=rkm*1000,color="#ff2222",
+                          fill=True,fill_opacity=0.3,tooltip="通行止め").add_to(m)
             folium.Marker([b_lat,b_lon],icon=folium.Icon(icon="ban",prefix="fa",color="red")).add_to(m)
     folium.Marker([o_lat,o_lon],icon=folium.Icon(icon="play",prefix="fa",color="blue"),tooltip="出発").add_to(m)
     folium.Marker([d_lat,d_lon],icon=folium.Icon(icon="flag",prefix="fa",color="darkgreen"),tooltip="到着").add_to(m)
@@ -432,45 +432,64 @@ function rr(x,y,w,h,r){{
   ctx.quadraticCurveTo(x,y,x+r,y);ctx.closePath();
 }}
 function draw(){{
+  // ── 床：明るいグレー系 ──
   const g=ctx.createLinearGradient(0,0,0,FH);
-  g.addColorStop(0,'#111827');g.addColorStop(1,'#0d1520');
+  g.addColorStop(0,'#e8edf2');g.addColorStop(1,'#d4dbe4');
   ctx.fillStyle=g;ctx.fillRect(0,0,FW,FH);
-  ctx.strokeStyle='rgba(77,150,255,0.05)';ctx.lineWidth=1;
+
+  // ── グリッド ──
+  ctx.strokeStyle='rgba(100,130,180,0.2)';ctx.lineWidth=1;
   for(let x=0;x<FW;x+=40){{ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,FH);ctx.stroke();}}
   for(let y=0;y<FH;y+=40){{ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(FW,y);ctx.stroke();}}
-  ctx.setLineDash([14,8]);ctx.strokeStyle='rgba(255,217,61,0.18)';ctx.lineWidth=20;
+
+  // ── 搬送路レーン：明るい黄色 ──
+  ctx.setLineDash([14,8]);ctx.strokeStyle='rgba(230,180,0,0.55)';ctx.lineWidth=22;
   ctx.beginPath();
   ctx.moveTo(45,385);ctx.lineTo(700,385);
   ctx.moveTo(185,385);ctx.lineTo(185,105);
   ctx.moveTo(520,385);ctx.lineTo(520,105);
   ctx.moveTo(185,240);ctx.lineTo(665,240);
   ctx.stroke();ctx.setLineDash([]);
+
+  // ── 棚：水色 ──
   [[275,65,75,75],[360,65,75,75],[445,65,75,75],[275,150,75,75],[445,150,75,75]].forEach(([sx,sy,sw,sh])=>{{
     const sg=ctx.createLinearGradient(sx,sy,sx,sy+sh);
-    sg.addColorStop(0,'#1a3a5c');sg.addColorStop(1,'#0f2540');
-    ctx.fillStyle=sg;ctx.strokeStyle='rgba(77,150,255,0.25)';ctx.lineWidth=1.5;
+    sg.addColorStop(0,'#b8d4f0');sg.addColorStop(1,'#8ab8e8');
+    ctx.fillStyle=sg;ctx.strokeStyle='#5588cc';ctx.lineWidth=1.5;
     rr(sx,sy,sw,sh,4);ctx.fill();ctx.stroke();
-    ctx.fillStyle='rgba(77,150,255,0.35)';ctx.font='bold 8px monospace';
+    ctx.fillStyle='#1a4070';ctx.font='bold 9px monospace';
     ctx.textAlign='center';ctx.fillText('SHELF',sx+sw/2,sy+sh/2+3);
   }});
-  ctx.strokeStyle='rgba(255,255,255,0.08)';ctx.lineWidth=4;ctx.strokeRect(3,3,FW-6,FH-6);
+
+  // ── 外壁 ──
+  ctx.strokeStyle='rgba(60,80,120,0.4)';ctx.lineWidth=5;ctx.strokeRect(3,3,FW-6,FH-6);
+
+  // ── ステーション ──
   stats.forEach(s=>{{
-    const rg=ctx.createRadialGradient(s.x,s.y,3,s.x,s.y,24);
-    rg.addColorStop(0,'rgba(77,150,255,0.28)');rg.addColorStop(1,'rgba(77,150,255,0)');
-    ctx.fillStyle=rg;ctx.beginPath();ctx.arc(s.x,s.y,24,0,Math.PI*2);ctx.fill();
-    ctx.fillStyle='#1a3060';ctx.strokeStyle='#4d96ff';ctx.lineWidth=1.8;
-    rr(s.x-21,s.y-13,42,26,5);ctx.fill();ctx.stroke();
-    ctx.fillStyle='#aac4ff';ctx.font='bold 8px "Segoe UI"';ctx.textAlign='center';ctx.fillText(s.name,s.x,s.y+3);
+    const rg=ctx.createRadialGradient(s.x,s.y,3,s.x,s.y,26);
+    rg.addColorStop(0,'rgba(50,120,255,0.25)');rg.addColorStop(1,'rgba(50,120,255,0)');
+    ctx.fillStyle=rg;ctx.beginPath();ctx.arc(s.x,s.y,26,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle='#ddeeff';ctx.strokeStyle='#2266cc';ctx.lineWidth=2;
+    rr(s.x-23,s.y-14,46,28,6);ctx.fill();ctx.stroke();
+    ctx.fillStyle='#003388';ctx.font='bold 9px "Segoe UI"';ctx.textAlign='center';
+    ctx.fillText(s.name,s.x,s.y+4);
   }});
+
+  // ── AGV ──
   agvs.forEach(a=>{{
-    const col=a.status==='wait'?'#ff4444':a.status==='dwell'?'#ffd93d':a.color;
-    ctx.strokeStyle=a.color+'33';ctx.lineWidth=1;ctx.setLineDash([4,6]);
+    const col=a.status==='wait'?'#dd2222':a.status==='dwell'?'#cc8800':a.color;
+    // ゴール線
+    ctx.strokeStyle=a.color+'66';ctx.lineWidth=1.5;ctx.setLineDash([4,6]);
     ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(a.gx,a.gy);ctx.stroke();ctx.setLineDash([]);
-    ctx.fillStyle=a.color+'88';ctx.beginPath();ctx.arc(a.gx,a.gy,4,0,Math.PI*2);ctx.fill();
-    ctx.shadowColor=col;ctx.shadowBlur=10;ctx.fillStyle=col;
-    ctx.strokeStyle='rgba(255,255,255,0.75)';ctx.lineWidth=1.5;
-    rr(a.x-13,a.y-9,26,18,4);ctx.fill();ctx.stroke();ctx.shadowBlur=0;
-    ctx.fillStyle='#fff';ctx.font='bold 9px monospace';ctx.textAlign='center';ctx.textBaseline='middle';
+    // ゴール点
+    ctx.fillStyle=a.color+'cc';ctx.beginPath();ctx.arc(a.gx,a.gy,5,0,Math.PI*2);ctx.fill();
+    // 本体（影付き）
+    ctx.shadowColor='rgba(0,0,0,0.4)';ctx.shadowBlur=8;ctx.shadowOffsetY=2;
+    ctx.fillStyle=col;ctx.strokeStyle='rgba(255,255,255,0.9)';ctx.lineWidth=2;
+    rr(a.x-14,a.y-10,28,20,5);ctx.fill();ctx.stroke();
+    ctx.shadowBlur=0;ctx.shadowOffsetY=0;
+    // ID
+    ctx.fillStyle='#fff';ctx.font='bold 10px monospace';ctx.textAlign='center';ctx.textBaseline='middle';
     ctx.fillText('T'+a.id,a.x,a.y);
   }});
   ctx.textBaseline='alphabetic';
