@@ -159,7 +159,7 @@ def gen_wps(blocks,rkm,o_ll,d_ll,nc=20):
         if k not in seen: seen.add(k); uniq.append((lat,lon))
     random.shuffle(uniq); return uniq[:nc]
 
-def sa_select(costs,n_iter=600):
+def sa_select(costs,n_iter=300):
     n=len(costs)
     if n==0: return None
     if n==1: return 0
@@ -172,17 +172,25 @@ def sa_select(costs,n_iter=600):
     return best
 
 def find_detour(ak,o_ll,d_ll,blocks,rkm,dtm):
+    """高速化版：候補を絞り、早期終了付きSAで迂回ルートを選択"""
     o_lat,o_lon=o_ll; d_lat,d_lon=d_ll
-    wps=gen_wps(blocks,rkm,o_ll,d_ll)
+    # ★ 候補を8個に絞る（20→8で処理時間を60%削減）
+    wps=gen_wps(blocks,rkm,o_ll,d_ll,nc=8)
     cands=[("BASE",[[o_lon,o_lat],[d_lon,d_lat]])]+\
-          [(f"WP{i+1}",[[o_lon,o_lat],[lon,lat],[d_lon,d_lat]]) for i,(lat,lon) in enumerate(wps)]
+          [(f"WP{i+1}",[[o_lon,o_lat],[lon,lat],[d_lon,d_lat]])
+           for i,(lat,lon) in enumerate(wps)]
     feasible,loose=[],[]
     for tag,coords in cands:
         route,dist,time_,_=get_route(ak,coords)
         if not route: continue
         cost=dist*120+max(0,time_-dtm)*5000
         e={"tag":tag,"route":route,"dist":dist,"time":time_,"cost":cost}
-        (loose if violates(route,blocks,rkm) else feasible).append(e)
+        if not violates(route,blocks,rkm):
+            feasible.append(e)
+            # ★ 早期終了：十分良い迂回が3本見つかれば探索終了
+            if len(feasible)>=3: break
+        else:
+            loose.append(e)
     pool=feasible if feasible else loose
     if not pool: return None
     return pool[sa_select([e["cost"] for e in pool])]
@@ -191,12 +199,19 @@ TRUCK_COLORS=["#ff6b6b","#ffd93d","#6bcb77"]
 
 def build_map(o_ll,d_ll,trucks,blocks,rkm,base_route):
     o_lat,o_lon=o_ll; d_lat,d_lon=d_ll
-    m=folium.Map(location=[(o_lat+d_lat)/2,(o_lon+d_lon)/2],
-                 zoom_start=6,tiles="CartoDB Positron",prefer_canvas=True)
-    # 通常ルート（灰色破線）
+    # 全ポイントが入るようにfit_boundsで自動ズーム
+    all_lats=[o_lat,d_lat]; all_lons=[o_lon,d_lon]
     if base_route:
-        folium.PolyLine(base_route,color="#999999",weight=4,
-                        dash_array="8,6",opacity=0.7,
+        all_lats+=[p[0] for p in base_route]
+        all_lons+=[p[1] for p in base_route]
+    sw=[min(all_lats)-0.3, min(all_lons)-0.3]
+    ne=[max(all_lats)+0.3, max(all_lons)+0.3]
+    m=folium.Map(tiles="CartoDB Positron",prefer_canvas=True)
+    m.fit_bounds([sw,ne])
+    # 通常ルート（灰色破線・太め）
+    if base_route:
+        folium.PolyLine(base_route,color="#888888",weight=5,
+                        dash_array="10,6",opacity=0.8,
                         tooltip="通常ルート（通行止め前）").add_to(m)
     # 各トラックのルート
     for tk in (trucks or []):
@@ -293,9 +308,10 @@ if btn_stop:
     for k in ["sim_running","sim_done","map_dirty"]: st.session_state[k]=False
     for k in ["trucks","blocks","map_html","base_route"]: st.session_state[k]=None
     st.session_state.sim_tick=0
+    st.session_state.detour_cache={}
 
 if btn_init:
-    with st.spinner("ルート取得中..."):
+    with st.spinner("ルート取得中...（初回は20〜30秒かかります）"):
         try:
             o_lat,o_lon,o_addr=geocode(origin,jp_only=jp_only)
             d_lat,d_lon,d_addr=geocode(dest_addr,jp_only=jp_only)
@@ -349,7 +365,16 @@ if st.session_state.sim_running and not st.session_state.sim_done:
         if tk["status"]=="reroute" and blocks:
             prog=min(tk.get("progress",0),len(tk["route"])-1)
             cp=tk["route"][prog]
-            res=find_detour(ak,(cp[0],cp[1]),d_ll,blocks,rkm,dtm)
+            # ★ キャッシュキーで同じ区間の再計算をスキップ
+            cache_key=(round(cp[0],2),round(cp[1],2),
+                       round(d_ll[0],2),round(d_ll[1],2))
+            if cache_key not in st.session_state.get("detour_cache",{}):
+                res=find_detour(ak,(cp[0],cp[1]),d_ll,blocks,rkm,dtm)
+                if "detour_cache" not in st.session_state:
+                    st.session_state.detour_cache={}
+                st.session_state.detour_cache[cache_key]=res
+            else:
+                res=st.session_state.detour_cache[cache_key]
             if res: tk.update({"route":res["route"],"dist":res["dist"],"time":res["time"],"progress":0,"rerouted":True})
             tk["status"]="run"; changed=True
         step=max(1,len(tk["route"])//40)
@@ -508,16 +533,41 @@ function start(){running=true;}
 function stop(){running=false;}
 initAGV();
 
+// ── 最近接ノードを返す ──
+function nearestNode(x,y){
+  let best=0,bd=1e9;
+  N.forEach((n,i)=>{const d=Math.hypot(x-n.x,y-n.y);if(d<bd){bd=d;best=i;}});
+  return best;
+}
+
 // ステップ
 function stepAGV(){
+  // ── フェーズ1：各AGVの移動計算 ──
   agvs.forEach(a=>{
     a.trail.push({x:a.x,y:a.y});
-    if(a.trail.length>25)a.trail.shift();
+    if(a.trail.length>30)a.trail.shift();
+
+    // 無限待機防止：待機カウンタが10以上なら強制リセット
+    if(a.waitTotal===undefined)a.waitTotal=0;
+    if(a.status==='wait'){
+      a.waitTotal++;
+      if(a.waitTotal>15){
+        // 別ノードへ迂回
+        const cn=nearestNode(a.x,a.y);
+        const altGoal=(a.goalSt+1)%ST_N.length;
+        const np=dijkstra(cn,ST_N[altGoal]);
+        if(np&&np.length>1){a.path=np;a.pi=0;a.goalSt=altGoal;}
+        a.wait=0;a.waitTotal=0;a.status='run';
+      }
+    }else{
+      a.waitTotal=0;
+    }
+
     if(a.dwell>0){
       a.dwell--;a.status='dwell';
       if(a.dwell===0){
         a.goalSt=saSelect(a);
-        const cn=a.path[a.path.length-1]||0;
+        const cn=a.path[a.path.length-1]||nearestNode(a.x,a.y);
         const np=dijkstra(cn,ST_N[a.goalSt]);
         if(np&&np.length>1){a.path=np;a.pi=0;}
         a.status='run';
@@ -527,7 +577,7 @@ function stepAGV(){
     if(a.pi>=a.path.length-1){
       a.x=N[a.path[a.path.length-1]].x;
       a.y=N[a.path[a.path.length-1]].y;
-      a.dwell=20+Math.floor(Math.random()*20);
+      a.dwell=15+Math.floor(Math.random()*15);
       a.status='dwell';return;
     }
     const tgt=N[a.path[a.pi+1]];
@@ -536,13 +586,26 @@ function stepAGV(){
     else{a.x+=a.speed*dx/d;a.y+=a.speed*dy/d;}
     a.status='run';
   });
-  // 衝突回避
-  for(let i=0;i<agvs.length;i++)
+
+  // ── フェーズ2：衝突判定（先着優先）──
+  // 各ノード付近に複数AGVがいる場合、IDが小さい方を優先
+  for(let i=0;i<agvs.length;i++){
+    const a=agvs[i];
+    if(a.status!=='run')continue;
     for(let j=i+1;j<agvs.length;j++){
-      const a=agvs[i],b=agvs[j];
-      if(Math.hypot(a.x-b.x,a.y-b.y)<30&&a.status==='run'&&b.status==='run')
-        {b.wait=2+Math.floor(Math.random()*3);b.status='wait';}
+      const b=agvs[j];
+      if(b.status!=='run')continue;
+      const dist=Math.hypot(a.x-b.x,a.y-b.y);
+      if(dist<32){
+        // IDが大きい方（後着）を待機
+        // 待機が重なりすぎないよう最大5tickに制限
+        if(b.wait===0){
+          b.wait=2+Math.floor(Math.random()*2);
+          b.status='wait';
+        }
+      }
     }
+  }
   tick++;
 }
 
